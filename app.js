@@ -2,76 +2,172 @@
 "use strict";
 
 /* ============================================================
-   1. BASE DE DATOS LOCAL (IndexedDB)
+   1. CONEXIÓN A SUPABASE (base de datos + autenticación + archivos en la nube)
    ------------------------------------------------------------
-   Se usa IndexedDB (motor nativo del navegador) en vez de un
-   archivo .sqlite real, porque un navegador no puede leer ni
-   escribir un archivo SQLite por sí solo sin cargar una librería
-   externa (p.ej. sql.js/WASM). IndexedDB no requiere ninguna
-   dependencia, funciona 100% offline y persiste automáticamente
-   en el equipo. El botón "Backup" exporta todo a un .json que
-   sirve como copia portable real (ver instrucciones al final
-   del chat).
+   Esta versión ya NO guarda los datos en el navegador (IndexedDB).
+   Todo vive en tu proyecto de Supabase, así que los 2-5 usuarios
+   ven la misma información en tiempo real, desde cualquier equipo,
+   siempre que haya conexión a internet.
    ============================================================ */
-const DB_NAME = "lextracker_db";
-const DB_VERSION = 3;
-let db;
+const SUPABASE_URL = "https://ntuunyaqxqcylfthzfoo.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_fPHIAnrSmkoE0vkA9r7Hqw_pOJ0O5ca";
+const DOCS_BUCKET = "documentos";
 
-function openDB(){
-  return new Promise((resolve,reject)=>{
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = (e)=>{
-      const d = e.target.result;
-      if(!d.objectStoreNames.contains("processes")){
-        const s = d.createObjectStore("processes",{keyPath:"id",autoIncrement:true});
-        s.createIndex("estado","estado"); s.createIndex("entidad","entidad");
-      }
-      if(!d.objectStoreNames.contains("actuaciones")){
-        const s = d.createObjectStore("actuaciones",{keyPath:"id",autoIncrement:true});
-        s.createIndex("processId","processId");
-      }
-      if(!d.objectStoreNames.contains("documentos")){
-        const s = d.createObjectStore("documentos",{keyPath:"id",autoIncrement:true});
-        s.createIndex("processId","processId");
-      }
-      if(!d.objectStoreNames.contains("personas")){
-        const s = d.createObjectStore("personas",{keyPath:"id",autoIncrement:true});
-        s.createIndex("processId","processId");
-      }
-      if(!d.objectStoreNames.contains("notas")){
-        d.createObjectStore("notas",{keyPath:"processId"});
-      }
-      if(!d.objectStoreNames.contains("notas_items")){
-        const s = d.createObjectStore("notas_items",{keyPath:"id",autoIncrement:true});
-        s.createIndex("processId","processId");
-      }
-      if(!d.objectStoreNames.contains("tareas")){
-        const s = d.createObjectStore("tareas",{keyPath:"id",autoIncrement:true});
-        s.createIndex("processId","processId");
-      }
-      if(!d.objectStoreNames.contains("historial")){
-        const s = d.createObjectStore("historial",{keyPath:"id",autoIncrement:true});
-        s.createIndex("processId","processId");
-      }
-      if(!d.objectStoreNames.contains("meta")){
-        d.createObjectStore("meta",{keyPath:"key"});
-      }
-    };
-    req.onsuccess = ()=>{ db = req.result; resolve(db); };
-    req.onerror = ()=> reject(req.error);
-  });
-}
-function tx(stores, mode){ return db.transaction(stores, mode||"readonly"); }
-function reqp(r){ return new Promise((res,rej)=>{ r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); }); }
-const DB = {
-  add:(store,obj)=> reqp(tx(store,"readwrite").objectStore(store).add(obj)),
-  put:(store,obj)=> reqp(tx(store,"readwrite").objectStore(store).put(obj)),
-  get:(store,key)=> reqp(tx(store).objectStore(store).get(key)),
-  del:(store,key)=> reqp(tx(store,"readwrite").objectStore(store).delete(key)),
-  all:(store)=> reqp(tx(store).objectStore(store).getAll()),
-  byIndex:(store,idx,val)=> reqp(tx(store).objectStore(store).index(idx).getAll(val)),
-  clear:(store)=> reqp(tx(store,"readwrite").objectStore(store).clear()),
+const sbClient = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// Nombre de "store" (como en IndexedDB) -> nombre real de la tabla en Postgres
+const STORE_TABLE = {
+  processes: "processes",
+  actuaciones: "actuaciones",
+  documentos: "documentos",
+  personas: "personas",
+  notas_items: "notas_items",
+  tareas: "tareas",
+  historial: "historial",
+  meta: "app_meta",
 };
+// Tablas "hijas" que en la app usan processId (camelCase) pero en la
+// base de datos la columna se llama process_id (snake_case)
+const CHILD_STORES = new Set(["actuaciones","documentos","personas","notas_items","tareas","historial"]);
+
+function toRow(store, obj){
+  const row = { ...obj };
+  if(CHILD_STORES.has(store) && "processId" in row){
+    row.process_id = row.processId;
+    delete row.processId;
+  }
+  if(store==="processes" && "_waSent" in row){
+    row.wa_sent = row._waSent;
+    delete row._waSent;
+  }
+  return row;
+}
+function fromRow(store, row){
+  if(!row) return row;
+  const obj = { ...row };
+  if(CHILD_STORES.has(store) && "process_id" in obj){
+    obj.processId = obj.process_id;
+    delete obj.process_id;
+  }
+  if(store==="processes" && "wa_sent" in obj){
+    obj._waSent = obj.wa_sent || {};
+    delete obj.wa_sent;
+  }
+  return obj;
+}
+
+const DB = {
+  async add(store, obj){
+    const table = STORE_TABLE[store];
+    if(store==="meta"){
+      const { data, error } = await sbClient.from(table).upsert({key:obj.key, value:obj.value}).select().single();
+      if(error) throw error;
+      return data;
+    }
+    const { data, error } = await sbClient.from(table).insert(toRow(store,obj)).select().single();
+    if(error) throw error;
+    return fromRow(store,data).id;
+  },
+  async put(store, obj){
+    const table = STORE_TABLE[store];
+    if(store==="meta"){
+      const { error } = await sbClient.from(table).upsert({key:obj.key, value:obj.value});
+      if(error) throw error;
+      return obj;
+    }
+    const { error } = await sbClient.from(table).update(toRow(store,obj)).eq("id", obj.id);
+    if(error) throw error;
+    return obj;
+  },
+  async get(store, key){
+    const table = STORE_TABLE[store];
+    if(store==="meta"){
+      const { data, error } = await sbClient.from(table).select("*").eq("key", key).maybeSingle();
+      if(error) throw error;
+      return data ? {key:data.key, value:data.value} : undefined;
+    }
+    const { data, error } = await sbClient.from(table).select("*").eq("id", key).maybeSingle();
+    if(error) throw error;
+    return fromRow(store, data);
+  },
+  async del(store, key){
+    const table = STORE_TABLE[store];
+    const col = store==="meta" ? "key" : "id";
+    const { error } = await sbClient.from(table).delete().eq(col, key);
+    if(error) throw error;
+  },
+  async all(store){
+    const table = STORE_TABLE[store];
+    const { data, error } = await sbClient.from(table).select("*").order("id",{ascending:true}).limit(5000);
+    if(error) throw error;
+    if(store==="meta") return (data||[]).map(r=>({key:r.key, value:r.value}));
+    return (data||[]).map(r=>fromRow(store,r));
+  },
+  async byIndex(store, idx, val){
+    const table = STORE_TABLE[store];
+    const col = idx==="processId" ? "process_id" : idx;
+    const { data, error } = await sbClient.from(table).select("*").eq(col, val);
+    if(error) throw error;
+    return (data||[]).map(r=>fromRow(store,r));
+  },
+  async clear(store){
+    const table = STORE_TABLE[store];
+    const col = store==="meta" ? "key" : "id";
+    const { error } = await sbClient.from(table).delete().neq(col, "___imposible___");
+    if(error) throw error;
+  },
+};
+
+/* ---- Autenticación ---- */
+const loginOverlay = document.getElementById("login-overlay");
+function showLogin(){ loginOverlay.classList.add("open"); }
+function hideLogin(){ loginOverlay.classList.remove("open"); }
+
+async function doLogin(){
+  const email = document.getElementById("login-email").value.trim();
+  const password = document.getElementById("login-password").value;
+  const errBox = document.getElementById("login-error");
+  errBox.classList.add("hidden");
+  if(!email || !password){ errBox.textContent = "Ingresa tu correo y tu contraseña."; errBox.classList.remove("hidden"); return; }
+  const { error } = await sbClient.auth.signInWithPassword({ email, password });
+  if(error){ errBox.textContent = "No pudimos iniciar sesión: " + error.message; errBox.classList.remove("hidden"); return; }
+  hideLogin();
+  await onAuthReady();
+}
+document.getElementById("btn-login").addEventListener("click", doLogin);
+document.getElementById("login-password").addEventListener("keydown",(e)=>{ if(e.key==="Enter") doLogin(); });
+document.getElementById("btn-forgot-password").addEventListener("click", async ()=>{
+  const email = document.getElementById("login-email").value.trim();
+  if(!email){ toast("Escribe tu correo arriba primero","err"); return; }
+  const { error } = await sbClient.auth.resetPasswordForEmail(email);
+  if(error){ toast("No se pudo enviar el correo: "+error.message,"err"); return; }
+  toast("Te enviamos un correo para restablecer tu contraseña","ok");
+});
+document.getElementById("btn-logout").addEventListener("click", async ()=>{
+  await sbClient.auth.signOut();
+  location.reload();
+});
+
+let REALTIME_WIRED = false;
+function wireRealtimeSync(){
+  if(REALTIME_WIRED) return;
+  REALTIME_WIRED = true;
+  let debounceTimer = null;
+  const debouncedRefresh = ()=>{ clearTimeout(debounceTimer); debounceTimer = setTimeout(()=>refreshAll(), 600); };
+  const tables = ["processes","actuaciones","documentos","personas","notas_items","tareas","historial"];
+  const channel = sbClient.channel("ocid-realtime");
+  tables.forEach(t=> channel.on("postgres_changes", {event:"*", schema:"public", table:t}, debouncedRefresh));
+  channel.subscribe();
+}
+
+async function onAuthReady(){
+  const { data: { session } } = await sbClient.auth.getSession();
+  if(!session){ showLogin(); return; }
+  document.getElementById("sb-user-email").textContent = session.user.email;
+  wireRealtimeSync();
+  await refreshAll();
+}
+
 
 /* ============================================================
    2. FESTIVOS COLOMBIANOS + CÁLCULO DE DÍAS HÁBILES
@@ -831,7 +927,7 @@ async function deleteProcess(id){
   await DB.del("processes", id);
   const stores = ["actuaciones","documentos","personas","historial","notas_items","tareas"];
   for(const s of stores){ const items = await DB.byIndex(s,"processId",id); for(const it of items) await DB.del(s, it.id); }
-  await DB.del("notas", id).catch(()=>{});
+  // (sin tabla "notas" legada en la nube — las notas viven en notas_items)
   toast("Proceso eliminado","ok");
   closeModal();
   await refreshAll();
@@ -907,14 +1003,14 @@ async function renderDocumentosTab(id){
   document.getElementById("doc-file-input").addEventListener("change", async (e)=>{
     const file = e.target.files[0]; if(!file) return;
     const folder = document.getElementById("doc-folder-select").value;
-    const reader = new FileReader();
-    reader.onload = async ()=>{
-      await DB.add("documentos", { processId:id, nombre:file.name, tipo:file.type, tamano:file.size, carpeta:folder, dataUrl:reader.result, subidoEn:new Date().toISOString() });
-      await logHistorial(id, `Documento adjuntado: ${file.name} (${folder})`);
-      toast("Documento adjuntado","ok");
-      await renderDocumentosTab(id);
-    };
-    reader.readAsDataURL(file);
+    const path = `${id}/${Date.now()}_${file.name.replace(/[^\w.\-]+/g,"_")}`;
+    toast("Subiendo archivo...","ok");
+    const { error: upErr } = await sbClient.storage.from(DOCS_BUCKET).upload(path, file);
+    if(upErr){ toast("No se pudo subir el archivo: "+upErr.message,"err"); return; }
+    await DB.add("documentos", { processId:id, nombre:file.name, tipo:file.type, tamano:file.size, carpeta:folder, storage_path:path, subidoEn:new Date().toISOString() });
+    await logHistorial(id, `Documento adjuntado: ${file.name} (${folder})`);
+    toast("Documento adjuntado","ok");
+    await renderDocumentosTab(id);
   });
   const foldersEl = document.getElementById("doc-folders");
   foldersEl.innerHTML = FOLDERS.map(f=>{
@@ -928,17 +1024,26 @@ async function renderDocumentosTab(id){
         </div>`).join("") : `<div class="empty-hint" style="text-align:left;padding:6px 2px;">Sin documentos.</div>`}
     </div>`;
   }).join("");
+  async function getSignedUrl(d){
+    const { data, error } = await sbClient.storage.from(DOCS_BUCKET).createSignedUrl(d.storage_path, 3600);
+    if(error){ toast("No se pudo generar el enlace del archivo: "+error.message,"err"); return null; }
+    return data.signedUrl;
+  }
   foldersEl.querySelectorAll("[data-view-doc]").forEach(btn=> btn.addEventListener("click", async ()=>{
     const d = await DB.get("documentos", Number(btn.dataset.viewDoc));
-    openDocumentViewer(d);
+    const url = await getSignedUrl(d);
+    if(url) openDocumentViewer(d, url);
   }));
   foldersEl.querySelectorAll("[data-open-doc]").forEach(btn=> btn.addEventListener("click", async ()=>{
     const d = await DB.get("documentos", Number(btn.dataset.openDoc));
-    const w = window.open(); w.document.write(`<title>${esc(d.nombre)}</title>`); w.location.href = d.dataUrl;
+    const url = await getSignedUrl(d);
+    if(url) window.open(url, "_blank");
   }));
   foldersEl.querySelectorAll("[data-del-doc]").forEach(btn=> btn.addEventListener("click", async ()=>{
     if(!confirm("¿Eliminar este documento?")) return;
-    await DB.del("documentos", Number(btn.dataset.delDoc));
+    const d = await DB.get("documentos", Number(btn.dataset.delDoc));
+    await sbClient.storage.from(DOCS_BUCKET).remove([d.storage_path]);
+    await DB.del("documentos", d.id);
     await logHistorial(id, "Documento eliminado");
     await renderDocumentosTab(id);
   }));
@@ -960,33 +1065,33 @@ function closeDocViewer(){ docViewerOverlay.classList.remove("open"); document.g
 docViewerOverlay.addEventListener("click",(e)=>{ if(e.target===docViewerOverlay) closeDocViewer(); });
 document.getElementById("doc-viewer-close").addEventListener("click", closeDocViewer);
 
-function openDocumentViewer(d){
+async function openDocumentViewer(d, url){
   document.getElementById("doc-viewer-title").textContent = d.nombre;
   const dl = document.getElementById("doc-viewer-download");
-  dl.href = d.dataUrl; dl.download = d.nombre;
+  dl.href = url; dl.download = d.nombre;
   const body = document.getElementById("doc-viewer-body");
   const t = (d.tipo||"").toLowerCase(), n=(d.nombre||"").toLowerCase();
   if(t.includes("pdf") || n.endsWith(".pdf")){
-    body.innerHTML = `<iframe src="${d.dataUrl}" style="width:100%;height:100%;border:none;background:#fff;"></iframe>`;
+    body.innerHTML = `<iframe src="${url}" style="width:100%;height:100%;border:none;background:#fff;"></iframe>`;
   } else if(t.startsWith("image")){
-    body.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;overflow:auto;background:var(--surface-2);"><img src="${d.dataUrl}" style="max-width:100%;max-height:100%;object-fit:contain;border-radius:8px;"></div>`;
+    body.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;overflow:auto;background:var(--surface-2);"><img src="${url}" style="max-width:100%;max-height:100%;object-fit:contain;border-radius:8px;"></div>`;
   } else if(t.startsWith("audio")){
-    body.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;flex-direction:column;gap:14px;"><div style="font-size:44px;">🎵</div><audio controls src="${d.dataUrl}" style="width:80%;max-width:480px;"></audio></div>`;
+    body.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;flex-direction:column;gap:14px;"><div style="font-size:44px;">🎵</div><audio controls src="${url}" style="width:80%;max-width:480px;"></audio></div>`;
   } else if(t.startsWith("video")){
-    body.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;background:#000;"><video controls src="${d.dataUrl}" style="max-width:100%;max-height:100%;"></video></div>`;
+    body.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;background:#000;"><video controls src="${url}" style="max-width:100%;max-height:100%;"></video></div>`;
   } else if(t==="text/plain" || n.endsWith(".txt") || n.endsWith(".csv") || n.endsWith(".md")){
     try{
-      const text = decodeURIComponent(escape(atob(d.dataUrl.split(",")[1])));
+      const text = await fetch(url).then(r=>r.text());
       body.innerHTML = `<pre style="padding:20px;white-space:pre-wrap;font-family:var(--font-mono);font-size:12.5px;height:100%;overflow:auto;margin:0;">${esc(text)}</pre>`;
     }catch(err){
       body.innerHTML = docPreviewUnavailable(d);
       const openBtn = document.getElementById("doc-preview-open-tab");
-      if(openBtn) openBtn.addEventListener("click", ()=>{ const w=window.open(); w.document.write(`<title>${esc(d.nombre)}</title>`); w.location.href = d.dataUrl; });
+      if(openBtn) openBtn.addEventListener("click", ()=> window.open(url,"_blank"));
     }
   } else {
     body.innerHTML = docPreviewUnavailable(d);
     const openBtn = document.getElementById("doc-preview-open-tab");
-    if(openBtn) openBtn.addEventListener("click", ()=>{ const w=window.open(); w.document.write(`<title>${esc(d.nombre)}</title>`); w.location.href = d.dataUrl; });
+    if(openBtn) openBtn.addEventListener("click", ()=> window.open(url,"_blank"));
   }
   docViewerOverlay.classList.add("open");
 }
@@ -1312,30 +1417,13 @@ async function renderHistorialTab(id){
    ============================================================ */
 document.getElementById("btn-backup").addEventListener("click", async ()=>{
   const data = {};
-  for(const s of ["processes","actuaciones","documentos","personas","notas","notas_items","tareas","historial","meta"]) data[s] = await DB.all(s);
-  const json = JSON.stringify({exportedAt:new Date().toISOString(), version:DB_VERSION, data});
-  downloadBlob(json, "application/json", `lextracker_backup_${todayStr()}.json`);
-  toast("Copia de seguridad descargada","ok");
+  for(const s of ["processes","actuaciones","documentos","personas","notas_items","tareas","historial","meta"]) data[s] = await DB.all(s);
+  const json = JSON.stringify({exportedAt:new Date().toISOString(), version:"cloud-v1", data});
+  downloadBlob(json, "application/json", `ocid_procesos_backup_${todayStr()}.json`);
+  toast("Copia de seguridad descargada (solo lectura, no restaurable desde aquí)","ok");
 });
-document.getElementById("btn-restore").addEventListener("click", ()=> document.getElementById("file-restore").click());
-document.getElementById("file-restore").addEventListener("change",(e)=>{
-  const file = e.target.files[0]; if(!file) return;
-  if(!confirm("Restaurar reemplazará TODOS los datos actuales por los del archivo. ¿Continuar?")) { e.target.value=""; return; }
-  const reader = new FileReader();
-  reader.onload = async ()=>{
-    try{
-      const parsed = JSON.parse(reader.result);
-      const data = parsed.data || parsed;
-      for(const s of ["processes","actuaciones","documentos","personas","notas","notas_items","tareas","historial","meta"]){
-        await DB.clear(s);
-        for(const item of (data[s]||[])) await DB.put(s, item);
-      }
-      toast("Datos restaurados correctamente","ok");
-      await refreshAll();
-    }catch(err){ toast("Archivo de backup inválido","err"); }
-    e.target.value="";
-  };
-  reader.readAsText(file);
+document.getElementById("btn-restore").addEventListener("click", ()=>{
+  toast("En la versión en la nube, 'Restaurar' no está disponible: podría corromper los datos compartidos del equipo. Usa 'Backup' solo como copia de seguridad de lectura.","err");
 });
 
 /* ============================================================
@@ -1482,13 +1570,23 @@ document.getElementById("btn-export-exec").addEventListener("click", ()=>{
    16. INIT
    ============================================================ */
 async function init(){
-  await openDB();
-  const themeMeta = await DB.get("meta","theme").catch(()=>null);
-  if(themeMeta && themeMeta.value==="dark"){ document.documentElement.setAttribute("data-theme","dark"); document.getElementById("theme-toggle").querySelector(".dot").textContent="☀"; }
-  await refreshAll();
+  const { data: { session } } = await sbClient.auth.getSession();
+  if(!session){
+    showLogin();
+  } else {
+    document.getElementById("sb-user-email").textContent = session.user.email;
+    const themeMeta = await DB.get("meta","theme").catch(()=>null);
+    if(themeMeta && themeMeta.value==="dark"){ document.documentElement.setAttribute("data-theme","dark"); document.getElementById("theme-toggle").querySelector(".dot").textContent="☀"; }
+    wireRealtimeSync();
+    await refreshAll();
+  }
   // Revisa alertas de WhatsApp cada 30 minutos mientras la pestaña permanezca abierta,
   // para detectar el cambio de día sin depender de que el usuario guarde algo.
-  setInterval(checkWhatsappAlerts, 30*60*1000);
+  setInterval(()=>{ if(!loginOverlay.classList.contains("open")) checkWhatsappAlerts(); }, 30*60*1000);
+
+  sbClient.auth.onAuthStateChange((event)=>{
+    if(event==="SIGNED_OUT") location.reload();
+  });
 }
 init();
 
