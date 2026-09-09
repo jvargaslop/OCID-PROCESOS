@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Importar backup — OCID PROCESOS</title>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:#F7F8FA;color:#12151B;margin:0;padding:0;}
+  .wrap{max-width:640px;margin:40px auto;padding:0 20px;}
+  .card{background:#fff;border:1px solid #E4E7EC;border-radius:14px;padding:24px 26px;margin-bottom:18px;box-shadow:0 1px 2px rgba(16,24,40,.06);}
+  h1{font-size:18px;margin:0 0 4px;color:#3A2560;}
+  p.sub{color:#8A93A3;font-size:13px;margin:0 0 20px;}
+  label{font-size:12.5px;font-weight:700;color:#4B5262;display:block;margin-bottom:6px;}
+  input[type=email],input[type=password],input[type=file]{width:100%;padding:9px 10px;border:1px solid #E4E7EC;border-radius:8px;font-size:14px;box-sizing:border-box;margin-bottom:14px;}
+  button{background:#00814F;color:#fff;border:none;padding:10px 16px;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer;}
+  button:disabled{opacity:.5;cursor:not-allowed;}
+  button.secondary{background:#fff;color:#12151B;border:1px solid #E4E7EC;}
+  #log{background:#12151B;color:#D6F5E3;font-family:monospace;font-size:12.5px;padding:14px;border-radius:10px;height:280px;overflow-y:auto;white-space:pre-wrap;margin-top:16px;}
+  .row{display:flex;gap:10px;align-items:center;}
+  .ok{color:#16A34A;font-weight:700;}
+  .err{color:#DC2626;font-weight:700;}
+  .hidden{display:none;}
+  .warn{background:#FCF3D2;color:#8a6400;padding:10px 12px;border-radius:8px;font-size:12.5px;margin-bottom:16px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>Importar backup a OCID PROCESOS (nube)</h1>
+    <p class="sub">Herramienta de un solo uso. Sube tu archivo de backup .json de la versión offline y lo migra a tu proyecto de Supabase.</p>
+    <div class="warn">⚠️ Úsala UNA sola vez. Si la corres dos veces con el mismo archivo, vas a duplicar todos los procesos.</div>
+
+    <div id="login-block">
+      <label>Correo</label>
+      <input type="email" id="email" placeholder="tucorreo@idsn.gov.co">
+      <label>Contraseña</label>
+      <input type="password" id="password">
+      <button id="btn-login">Iniciar sesión</button>
+      <div id="login-msg" style="margin-top:10px;font-size:13px;"></div>
+    </div>
+
+    <div id="import-block" class="hidden">
+      <p style="font-size:13px;">Sesión iniciada como <b id="user-email"></b>.</p>
+      <label>Archivo de backup (.json)</label>
+      <input type="file" id="file-input" accept="application/json">
+      <button id="btn-import" disabled>Importar ahora</button>
+      <button class="secondary" id="btn-logout" style="margin-left:8px;">Cerrar sesión</button>
+    </div>
+  </div>
+  <div class="card hidden" id="log-card">
+    <div id="log"></div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script>
+const SUPABASE_URL = "https://ntuunyaqxqcylfthzfoo.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_fPHIAnrSmkoE0vkA9r7Hqw_pOJ0O5ca";
+const DOCS_BUCKET = "documentos";
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+const logCard = document.getElementById("log-card");
+const logEl = document.getElementById("log");
+function log(msg, cls){
+  logCard.classList.remove("hidden");
+  const line = document.createElement("div");
+  if(cls) line.className = cls;
+  line.textContent = msg;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+document.getElementById("btn-login").addEventListener("click", async ()=>{
+  const email = document.getElementById("email").value.trim();
+  const password = document.getElementById("password").value;
+  const msg = document.getElementById("login-msg");
+  const { data, error } = await sb.auth.signInWithPassword({ email, password });
+  if(error){ msg.innerHTML = '<span class="err">Error: '+error.message+'</span>'; return; }
+  document.getElementById("login-block").classList.add("hidden");
+  document.getElementById("import-block").classList.remove("hidden");
+  document.getElementById("user-email").textContent = data.user.email;
+});
+document.getElementById("btn-logout").addEventListener("click", async ()=>{
+  await sb.auth.signOut();
+  location.reload();
+});
+
+let selectedFile = null;
+document.getElementById("file-input").addEventListener("change",(e)=>{
+  selectedFile = e.target.files[0] || null;
+  document.getElementById("btn-import").disabled = !selectedFile;
+});
+
+function dataUrlToBlob(dataUrl){
+  return fetch(dataUrl).then(r=>r.blob());
+}
+
+document.getElementById("btn-import").addEventListener("click", async ()=>{
+  document.getElementById("btn-import").disabled = true;
+  logEl.innerHTML = "";
+  try{
+    const text = await selectedFile.text();
+    const parsed = JSON.parse(text);
+    const data = parsed.data || parsed;
+    log("Archivo leído correctamente. Iniciando importación...");
+
+    // 1) Procesos: se insertan primero, y guardamos el mapa id-viejo -> id-nuevo
+    const idMap = {};
+    const oldProcesses = data.processes || [];
+    log(`Procesos a importar: ${oldProcesses.length}`);
+    for(const p of oldProcesses){
+      const { id: oldId, ...rest } = p;
+      if("_waSent" in rest){ rest.wa_sent = rest._waSent; delete rest._waSent; }
+      const { data: inserted, error } = await sb.from("processes").insert(rest).select().single();
+      if(error){ log(`✕ Error en proceso "${p.radicado||oldId}": ${error.message}`, "err"); continue; }
+      idMap[oldId] = inserted.id;
+      log(`✓ Proceso "${p.radicado||"(sin radicado)"}" importado (id ${oldId} → ${inserted.id})`, "ok");
+    }
+
+    // 2) Tablas hijas simples (sin archivos)
+    const childTables = [
+      {store:"actuaciones", table:"actuaciones"},
+      {store:"personas", table:"personas"},
+      {store:"notas_items", table:"notas_items"},
+      {store:"tareas", table:"tareas"},
+      {store:"historial", table:"historial"},
+    ];
+    for(const ct of childTables){
+      const items = data[ct.store] || [];
+      let ok=0, fail=0;
+      for(const item of items){
+        const { id: oldId, processId, ...rest } = item;
+        const newProcessId = idMap[processId];
+        if(!newProcessId){ fail++; continue; }
+        rest.process_id = newProcessId;
+        const { error } = await sb.from(ct.table).insert(rest);
+        if(error){ fail++; continue; }
+        ok++;
+      }
+      log(`${ct.store}: ${ok} importados${fail? ", "+fail+" omitidos/con error":""}`, fail? "err":"ok");
+    }
+
+    // 3) Documentos: hay que resubir el archivo (viene en base64 como dataUrl)
+    const docs = data.documentos || [];
+    log(`Documentos a importar: ${docs.length} (esto puede tardar varios minutos)`);
+    let docOk=0, docFail=0;
+    for(const d of docs){
+      const newProcessId = idMap[d.processId];
+      if(!newProcessId || !d.dataUrl){ docFail++; continue; }
+      try{
+        const blob = await dataUrlToBlob(d.dataUrl);
+        const path = `${newProcessId}/${Date.now()}_${(d.nombre||"archivo").replace(/[^\w.\-]+/g,"_")}`;
+        const { error: upErr } = await sb.storage.from(DOCS_BUCKET).upload(path, blob, {contentType:d.tipo||undefined});
+        if(upErr){ log(`✕ ${d.nombre}: ${upErr.message}`, "err"); docFail++; continue; }
+        const { error: insErr } = await sb.from("documentos").insert({
+          process_id:newProcessId, nombre:d.nombre, tipo:d.tipo, tamano:d.tamano,
+          carpeta:d.carpeta, storage_path:path, subidoEn:d.subidoEn||new Date().toISOString()
+        });
+        if(insErr){ log(`✕ ${d.nombre}: ${insErr.message}`, "err"); docFail++; continue; }
+        docOk++;
+        log(`✓ Documento "${d.nombre}" subido`, "ok");
+      }catch(err){ docFail++; log(`✕ ${d.nombre}: ${err.message}`, "err"); }
+    }
+    log(`Documentos: ${docOk} importados, ${docFail} con error/omitidos`, docFail? "err":"ok");
+
+    // 4) Meta (configuración, ej. WhatsApp) — se combina, no se borra lo existente
+    const metaItems = (data.meta||[]).filter(m=>m.key!=="theme");
+    for(const m of metaItems){
+      await sb.from("app_meta").upsert({key:m.key, value:m.value});
+    }
+    if(metaItems.length) log(`Configuración (meta) importada: ${metaItems.length} registro(s)`, "ok");
+
+    log("\n=== IMPORTACIÓN TERMINADA ===", "ok");
+    log("Ya puedes abrir la app normal (index.html) y ver tus datos.");
+  }catch(err){
+    log("Error general: "+err.message, "err");
+  }
+});
+</script>
+</body>
+</html>
