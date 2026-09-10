@@ -32,6 +32,7 @@ const CHILD_STORES = new Set(["actuaciones","documentos","personas","notas_items
 
 function toRow(store, obj){
   const row = { ...obj };
+  delete row.id; // "id" es generated always as identity: nunca se envía en insert/update, se referencia aparte con .eq("id", ...)
   if(CHILD_STORES.has(store) && "processId" in row){
     row.process_id = row.processId;
     delete row.processId;
@@ -541,10 +542,15 @@ function renderKanban(){
       if(p && p.estado!==col){
         const prev = p.estado;
         p.estado = col; p.actualizadoEn = new Date().toISOString();
-        await DB.put("processes", p);
-        await logHistorial(id, `Estado cambiado de "${prev}" a "${col}" (kanban)`);
-        toast("Estado actualizado","ok");
-        await refreshAll();
+        try{
+          await DB.put("processes", p);
+          await logHistorial(id, `Estado cambiado de "${prev}" a "${col}" (kanban)`);
+          toast("Estado actualizado","ok");
+          await refreshAll();
+        }catch(err){
+          p.estado = prev;
+          toast("No se pudo actualizar el estado: "+(err.message||err),"err");
+        }
       }
     });
     board.appendChild(colEl);
@@ -968,20 +974,24 @@ function bindResumenForm(p, id){
       updated.motivoArchivo = "";
     }
     if(id){
-      await DB.put("processes", updated);
-      await logHistorial(id, autoArchived? "Estado marcado como Inhibitorio → proceso archivado automáticamente" : "Información general actualizada");
-      toast(autoArchived? "Proceso archivado automáticamente (Inhibitorio)" : "Proceso guardado","ok");
-      await refreshAll();
-      openProcessModal(id);
+      try{
+        await DB.put("processes", updated);
+        await logHistorial(id, autoArchived? "Estado marcado como Inhibitorio → proceso archivado automáticamente" : "Información general actualizada");
+        toast(autoArchived? "Proceso archivado automáticamente (Inhibitorio)" : "Proceso guardado","ok");
+        await refreshAll();
+        openProcessModal(id);
+      }catch(err){ toast("No se pudo guardar: "+(err.message||err),"err"); }
     } else {
-      const newId = await DB.add("processes", updated);
-      if(STATE.me && STATE.me.id){
-        await sbClient.from("process_assignments").insert({process_id:newId, user_id:STATE.me.id}).select().maybeSingle().catch(()=>{});
-      }
-      await logHistorial(newId, autoArchived? "Proceso creado y archivado automáticamente (Inhibitorio)" : "Proceso creado");
-      toast(autoArchived? "Proceso archivado automáticamente (Inhibitorio)" : "Proceso creado","ok");
-      await refreshAll();
-      openProcessModal(newId);
+      try{
+        const newId = await DB.add("processes", updated);
+        if(STATE.me && STATE.me.id){
+          await sbClient.from("process_assignments").insert({process_id:newId, user_id:STATE.me.id}).select().maybeSingle().catch(()=>{});
+        }
+        await logHistorial(newId, autoArchived? "Proceso creado y archivado automáticamente (Inhibitorio)" : "Proceso creado");
+        toast(autoArchived? "Proceso archivado automáticamente (Inhibitorio)" : "Proceso creado","ok");
+        closeModal();
+        await refreshAll();
+      }catch(err){ toast("No se pudo crear el proceso: "+(err.message||err),"err"); }
     }
   });
 }
@@ -1041,10 +1051,10 @@ function openShareDialog(id){
   const overlay = smallModal("Compartir proceso", `
     <p style="font-size:12.5px;color:var(--text-muted);line-height:1.6;margin-top:0;">
       Genera un enlace de solo lectura para alguien SIN cuenta en el sistema. Tú eliges la clave ahora mismo;
-      la persona necesitará el enlace Y la clave para poder verlo. Por seguridad, los documentos adjuntos
-      no se muestran en el enlace compartido.
+      la persona necesitará el enlace Y la clave para poder verlo.
     </p>
     <div class="field"><label class="field-label">Clave de acceso para este enlace</label><input type="text" id="share-password" placeholder="Ej: idsn2026"></div>
+    <div class="field"><label class="field-label">Enlace de documentos (opcional — ej. carpeta de Google Drive)</label><input type="text" id="share-drive" placeholder="https://drive.google.com/..."></div>
     <div style="display:flex;justify-content:flex-end;gap:8px;"><button class="btn" id="share-cancel">Cancelar</button><button class="btn primary" id="share-create">Generar enlace</button></div>
     <div id="share-result" class="hidden" style="margin-top:16px;">
       <label class="field-label">Enlace para compartir</label>
@@ -1054,8 +1064,9 @@ function openShareDialog(id){
   overlay.querySelector("#share-cancel").addEventListener("click", ()=>overlay.remove());
   overlay.querySelector("#share-create").addEventListener("click", async ()=>{
     const password = overlay.querySelector("#share-password").value.trim();
+    const driveLink = overlay.querySelector("#share-drive").value.trim();
     if(!password || password.length<4){ toast("Escribe una clave de al menos 4 caracteres","err"); return; }
-    const { data: token, error } = await sbClient.rpc("create_share_link", { p_process_id:id, p_password:password });
+    const { data: token, error } = await sbClient.rpc("create_share_link", { p_process_id:id, p_password:password, p_drive_link: driveLink||null });
     if(error){ toast("No se pudo generar el enlace: "+error.message,"err"); return; }
     const baseUrl = location.origin + location.pathname.replace(/index\.html$/,"");
     const url = `${baseUrl}compartido.html?token=${token}`;
