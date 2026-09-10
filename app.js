@@ -160,10 +160,25 @@ function wireRealtimeSync(){
   channel.subscribe();
 }
 
+async function loadMyProfile(){
+  const { data: { user } } = await sbClient.auth.getUser();
+  if(!user){ STATE.me = null; return; }
+  let { data: profile } = await sbClient.from("profiles").select("id,email,role").eq("id", user.id).maybeSingle();
+  if(!profile){
+    // Por si el trigger aún no creó el perfil (usuarios creados antes de correr schema_update_2.sql)
+    const { data: created } = await sbClient.from("profiles").insert({id:user.id, email:user.email, role:"user"}).select().maybeSingle().catch(()=>({data:null}));
+    profile = created || { id:user.id, email:user.email, role:"user" };
+  }
+  STATE.me = profile;
+  const roleBadge = document.getElementById("sb-user-role");
+  if(roleBadge) roleBadge.textContent = profile.role==="admin" ? "Administrador" : "Usuario";
+}
+
 async function onAuthReady(){
   const { data: { session } } = await sbClient.auth.getSession();
   if(!session){ showLogin(); return; }
   document.getElementById("sb-user-email").textContent = session.user.email;
+  await loadMyProfile();
   wireRealtimeSync();
   await refreshAll();
 }
@@ -228,7 +243,7 @@ function businessDaysBetween(from,to){
    ============================================================ */
 const ESTADOS = ["Indagación previa","Investigación disciplinaria","Inhibitorio","Acumulado","Archivado"];
 const KANBAN_COLS = ["Indagación previa","Investigación disciplinaria","Acumulado","Archivado"];
-const FOLDERS = ["Expediente Completo","Autos","Oficios","Pruebas","Declaraciones","Notificaciones","Otros"];
+const FOLDERS = ["Expediente Completo","Anexos"];
 const TERM_PLANTILLAS = [
   {nombre:"Pruebas", dias:10},{nombre:"Notificación personal", dias:5},{nombre:"Edicto", dias:3}
 ];
@@ -243,6 +258,8 @@ let STATE = {
   calDate:new Date(),
   currentProcessId:null,
   currentTab:"resumen",
+  resumenEditMode:false,
+  me:null, // {id, email, role} del usuario logueado, se llena en loadMyProfile()
 };
 
 function toast(msg, kind){
@@ -791,6 +808,7 @@ function emptyProcess(){
 async function openProcessModal(id){
   STATE.currentProcessId = id;
   STATE.currentTab = "resumen";
+  STATE.resumenEditMode = false;
   let p = id ? STATE.processes.find(x=>x.id===id) : emptyProcess();
   await renderProcessModal(p, id);
   modalOverlay.classList.add("open");
@@ -798,12 +816,17 @@ async function openProcessModal(id){
 
 async function renderProcessModal(p, id){
   const isNew = !id;
+  const isAdmin = STATE.me && STATE.me.role === "admin";
+  modalEl.classList.toggle("fullscreen", !isNew);
+  modalOverlay.classList.toggle("fullscreen-mode", !isNew);
   modalEl.innerHTML = `
     <div class="modal-head">
       <h2>${isNew? "Nuevo proceso" : (esc(p.radicado)||"Proceso sin radicado")}</h2>
       ${!isNew?`${estadoBadge(p)}${prioBadge(p.prioridad)}`:""}
       <div class="spacer" style="flex:1"></div>
-      ${!isNew?`<button class="btn sm danger" id="btn-delete-process">Eliminar</button>`:""}
+      ${!isNew?`<button class="btn sm ghost" id="btn-edit-process" title="Editar este proceso">✎ Editar</button>`:""}
+      ${!isNew?`<button class="btn sm ghost" id="btn-share-process" title="Compartir con clave">🔗 Compartir</button>`:""}
+      ${(!isNew && isAdmin)?`<button class="btn sm danger" id="btn-delete-process">Eliminar</button>`:""}
       <button class="btn sm ghost close-x" id="btn-close-modal">✕</button>
     </div>
     ${!isNew?`<div class="tabs" id="modal-tabs">
@@ -814,12 +837,21 @@ async function renderProcessModal(p, id){
       <div class="tab" data-tab="terminos">Términos</div>
       <div class="tab" data-tab="tareas">Tareas</div>
       <div class="tab" data-tab="notas">Notas</div>
+      <div class="tab" data-tab="acceso">Acceso</div>
       <div class="tab" data-tab="historial">Historial</div>
     </div>`:""}
     <div class="modal-body" id="modal-body"></div>`;
   document.getElementById("btn-close-modal").addEventListener("click", closeModal);
-  if(!isNew) document.getElementById("btn-delete-process").addEventListener("click", ()=>deleteProcess(id));
   if(!isNew){
+    document.getElementById("btn-delete-process")?.addEventListener("click", ()=>deleteProcess(id));
+    document.getElementById("btn-edit-process").addEventListener("click", ()=>{
+      STATE.currentTab = "resumen";
+      STATE.resumenEditMode = true;
+      modalEl.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
+      modalEl.querySelector('.tab[data-tab="resumen"]').classList.add("active");
+      renderTabBody(p, id);
+    });
+    document.getElementById("btn-share-process").addEventListener("click", ()=> openShareDialog(id));
     modalEl.querySelectorAll(".tab").forEach(t=> t.addEventListener("click",()=>{
       modalEl.querySelectorAll(".tab").forEach(x=>x.classList.remove("active")); t.classList.add("active");
       STATE.currentTab = t.dataset.tab; renderTabBody(p, id);
@@ -831,14 +863,39 @@ async function renderProcessModal(p, id){
 async function renderTabBody(p, id){
   const body = document.getElementById("modal-body");
   const isNew = !id;
-  if(isNew || STATE.currentTab==="resumen"){ body.innerHTML = resumenFormHTML(p); bindResumenForm(p, id); return; }
+  if(isNew){ body.innerHTML = resumenFormHTML(p); bindResumenForm(p, id); return; }
+  if(STATE.currentTab==="resumen"){
+    if(STATE.resumenEditMode){ body.innerHTML = resumenFormHTML(p); bindResumenForm(p, id); }
+    else { body.innerHTML = resumenViewHTML(p); }
+    return;
+  }
   if(STATE.currentTab==="actuaciones"){ body.innerHTML = `<div id="tl-wrap"></div>`; await renderActuacionesTab(id); return; }
   if(STATE.currentTab==="documentos"){ body.innerHTML = `<div id="doc-wrap"></div>`; await renderDocumentosTab(id); return; }
   if(STATE.currentTab==="personas"){ body.innerHTML = `<div id="per-wrap"></div>`; await renderPersonasTab(id); return; }
   if(STATE.currentTab==="terminos"){ body.innerHTML = `<div id="term-wrap"></div>`; renderTerminosTab(p, id); return; }
   if(STATE.currentTab==="tareas"){ body.innerHTML = `<div id="tareas-wrap"></div>`; await renderTareasTab(id); return; }
   if(STATE.currentTab==="notas"){ body.innerHTML = `<div id="notas-wrap"></div>`; await renderNotasTab(id); return; }
+  if(STATE.currentTab==="acceso"){ body.innerHTML = `<div id="acceso-wrap"></div>`; await renderAccesoTab(id); return; }
   if(STATE.currentTab==="historial"){ body.innerHTML = `<div id="hist-wrap"></div>`; await renderHistorialTab(id); return; }
+}
+
+function fieldView(label, value){
+  const has = value !== undefined && value !== null && String(value).trim() !== "";
+  return `<div class="view-field"><div class="vl">${esc(label)}</div><div class="vv ${has?"":"empty"}">${has? esc(value) : "— sin dato —"}</div></div>`;
+}
+function resumenViewHTML(p){
+  return `
+    <div class="grid2">
+      ${fieldView("Radicado", p.radicado)}
+      ${fieldView("Investigado", p.investigado)}
+      ${fieldView(p.quejosoTipo==="Informante"?"Informante":"Quejoso", p.quejoso)}
+      ${fieldView("Fecha de apertura", p.fechaApertura? fmtDate(p.fechaApertura):"")}
+      ${fieldView("Fecha de vencimiento", p.fechaVencimiento? fmtDate(p.fechaVencimiento):"")}
+      ${fieldView("Estado", p.estado)}
+      ${fieldView("Prioridad", p.prioridad)}
+    </div>
+    ${fieldView("Observaciones", p.observaciones)}
+    <div style="margin-top:14px;font-size:11.5px;color:var(--text-muted);">Última actualización: ${p.actualizadoEn? new Date(p.actualizadoEn).toLocaleString("es-CO") : "—"}</div>`;
 }
 
 function resumenFormHTML(p){
@@ -878,7 +935,10 @@ function resumenFormHTML(p){
 }
 function bindResumenForm(p, id){
   const cancelBtn = document.getElementById("btn-cancel-form");
-  if(cancelBtn) cancelBtn.addEventListener("click", closeModal);
+  if(cancelBtn) cancelBtn.addEventListener("click", ()=>{
+    if(id){ STATE.resumenEditMode = false; renderTabBody(p, id); }
+    else closeModal();
+  });
   function addMonthsToVencimiento(months){
     const baseStr = document.getElementById("f-fechaApertura").value || todayStr();
     const base = new Date(baseStr+"T00:00:00");
@@ -915,6 +975,9 @@ function bindResumenForm(p, id){
       openProcessModal(id);
     } else {
       const newId = await DB.add("processes", updated);
+      if(STATE.me && STATE.me.id){
+        await sbClient.from("process_assignments").insert({process_id:newId, user_id:STATE.me.id}).select().maybeSingle().catch(()=>{});
+      }
       await logHistorial(newId, autoArchived? "Proceso creado y archivado automáticamente (Inhibitorio)" : "Proceso creado");
       toast(autoArchived? "Proceso archivado automáticamente (Inhibitorio)" : "Proceso creado","ok");
       await refreshAll();
@@ -931,6 +994,82 @@ async function deleteProcess(id){
   toast("Proceso eliminado","ok");
   closeModal();
   await refreshAll();
+}
+
+/* ---- Acceso: asignar el proceso a perfiles de usuario ---- */
+async function renderAccesoTab(id){
+  const wrap = document.getElementById("acceso-wrap");
+  const isAdmin = STATE.me && STATE.me.role === "admin";
+  const [{ data: profiles, error: perr }, { data: asigns, error: aerr }] = await Promise.all([
+    sbClient.from("profiles").select("id,email,role").order("email"),
+    sbClient.from("process_assignments").select("user_id").eq("process_id", id),
+  ]);
+  if(perr || aerr){ wrap.innerHTML = `<div class="empty-hint">No se pudo cargar la información de acceso.</div>`; return; }
+  const assignedIds = new Set((asigns||[]).map(a=>a.user_id));
+  if(!isAdmin){
+    const assignedEmails = (profiles||[]).filter(p=>assignedIds.has(p.id)).map(p=>p.email);
+    wrap.innerHTML = `
+      <div class="section-title">Usuarios con acceso a este proceso</div>
+      ${assignedEmails.length? assignedEmails.map(e=>`<div class="access-row">${esc(e)}</div>`).join("") : `<div class="empty-hint">Nadie más tiene este proceso asignado todavía.</div>`}
+      <div class="empty-hint" style="text-align:left;margin-top:10px;">Solo un administrador puede cambiar las asignaciones.</div>`;
+    return;
+  }
+  wrap.innerHTML = `
+    <div class="section-title">Asignar este proceso a</div>
+    ${(profiles||[]).map(p=>`
+      <div class="access-row">
+        <input type="checkbox" data-assign-user="${p.id}" ${assignedIds.has(p.id)?"checked":""}>
+        <div style="flex:1;">${esc(p.email)}</div>
+        <span class="badge tag">${p.role==="admin"?"Administrador":"Usuario"}</span>
+      </div>`).join("") || `<div class="empty-hint">No hay usuarios creados todavía.</div>`}`;
+  wrap.querySelectorAll("[data-assign-user]").forEach(chk=> chk.addEventListener("change", async ()=>{
+    const userId = chk.dataset.assignUser;
+    if(chk.checked){
+      const { error } = await sbClient.from("process_assignments").insert({process_id:id, user_id:userId});
+      if(error){ toast("No se pudo asignar: "+error.message,"err"); chk.checked=false; return; }
+      toast("Usuario asignado","ok");
+    } else {
+      const { error } = await sbClient.from("process_assignments").delete().eq("process_id",id).eq("user_id",userId);
+      if(error){ toast("No se pudo quitar el acceso: "+error.message,"err"); chk.checked=true; return; }
+      toast("Acceso removido","ok");
+    }
+  }));
+}
+
+/* ---- Compartir con clave (usuarios sin cuenta) ---- */
+function openShareDialog(id){
+  const overlay = smallModal("Compartir proceso", `
+    <p style="font-size:12.5px;color:var(--text-muted);line-height:1.6;margin-top:0;">
+      Genera un enlace de solo lectura para alguien SIN cuenta en el sistema. Tú eliges la clave ahora mismo;
+      la persona necesitará el enlace Y la clave para poder verlo. Por seguridad, los documentos adjuntos
+      no se muestran en el enlace compartido.
+    </p>
+    <div class="field"><label class="field-label">Clave de acceso para este enlace</label><input type="text" id="share-password" placeholder="Ej: idsn2026"></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;"><button class="btn" id="share-cancel">Cancelar</button><button class="btn primary" id="share-create">Generar enlace</button></div>
+    <div id="share-result" class="hidden" style="margin-top:16px;">
+      <label class="field-label">Enlace para compartir</label>
+      <div style="display:flex;gap:6px;margin-bottom:10px;"><input type="text" id="share-url" readonly><button class="btn sm" id="share-copy-url">Copiar</button></div>
+      <div class="empty-hint" style="text-align:left;">Envía el enlace y la clave por canales distintos (ej. enlace por correo, clave por WhatsApp) para mayor seguridad.</div>
+    </div>`);
+  overlay.querySelector("#share-cancel").addEventListener("click", ()=>overlay.remove());
+  overlay.querySelector("#share-create").addEventListener("click", async ()=>{
+    const password = overlay.querySelector("#share-password").value.trim();
+    if(!password || password.length<4){ toast("Escribe una clave de al menos 4 caracteres","err"); return; }
+    const { data: token, error } = await sbClient.rpc("create_share_link", { p_process_id:id, p_password:password });
+    if(error){ toast("No se pudo generar el enlace: "+error.message,"err"); return; }
+    const baseUrl = location.origin + location.pathname.replace(/index\.html$/,"");
+    const url = `${baseUrl}compartido.html?token=${token}`;
+    overlay.querySelector("#share-url").value = url;
+    overlay.querySelector("#share-result").classList.remove("hidden");
+    toast("Enlace generado","ok");
+  });
+  overlay.addEventListener("click",(e)=>{
+    if(e.target && e.target.id==="share-copy-url"){
+      const inp = overlay.querySelector("#share-url");
+      inp.select(); document.execCommand("copy");
+      toast("Enlace copiado","ok");
+    }
+  });
 }
 
 /* ---- Actuaciones (timeline) ---- */
@@ -1006,7 +1145,7 @@ async function renderDocumentosTab(id){
     const path = `${id}/${Date.now()}_${file.name.replace(/[^\w.\-]+/g,"_")}`;
     toast("Subiendo archivo...","ok");
     const { error: upErr } = await sbClient.storage.from(DOCS_BUCKET).upload(path, file);
-    if(upErr){ toast("No se pudo subir el archivo: "+upErr.message,"err"); return; }
+    if(upErr){ toast("No se pudo subir: "+upErr.message+" (revisa que el bucket 'documentos' exista y que corriste schema_update_1.sql)","err"); return; }
     await DB.add("documentos", { processId:id, nombre:file.name, tipo:file.type, tamano:file.size, carpeta:folder, storage_path:path, subidoEn:new Date().toISOString() });
     await logHistorial(id, `Documento adjuntado: ${file.name} (${folder})`);
     toast("Documento adjuntado","ok");
@@ -1575,6 +1714,7 @@ async function init(){
     showLogin();
   } else {
     document.getElementById("sb-user-email").textContent = session.user.email;
+    await loadMyProfile();
     const themeMeta = await DB.get("meta","theme").catch(()=>null);
     if(themeMeta && themeMeta.value==="dark"){ document.documentElement.setAttribute("data-theme","dark"); document.getElementById("theme-toggle").querySelector(".dot").textContent="☀"; }
     wireRealtimeSync();

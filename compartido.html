@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Proceso compartido — OCID PROCESOS</title>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:#F7F8FA;color:#12151B;margin:0;}
+  .wrap{max-width:720px;margin:0 auto;padding:40px 20px 60px;}
+  .card{background:#fff;border:1px solid #E4E7EC;border-radius:14px;padding:24px 26px;margin-bottom:16px;box-shadow:0 1px 2px rgba(16,24,40,.06);}
+  h1{font-size:18px;margin:0 0 4px;color:#3A2560;}
+  p.sub{color:#8A93A3;font-size:13px;margin:0 0 20px;}
+  label{font-size:12.5px;font-weight:700;color:#4B5262;display:block;margin-bottom:6px;}
+  input[type=password]{width:100%;padding:10px;border:1px solid #E4E7EC;border-radius:8px;font-size:15px;box-sizing:border-box;margin-bottom:14px;}
+  button{background:#00814F;color:#fff;border:none;padding:10px 18px;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer;}
+  .err{background:#FDEBEC;color:#DC2626;padding:10px 12px;border-radius:8px;font-size:13px;margin-bottom:14px;}
+  .hidden{display:none;}
+  .badge{display:inline-block;padding:2px 9px;border-radius:20px;font-size:11.5px;font-weight:700;background:#E4F5EC;color:#00814F;}
+  .section-title{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:#8A93A3;margin:0 0 10px;}
+  .vf{margin-bottom:12px;}
+  .vf .l{font-size:11px;font-weight:700;color:#8A93A3;text-transform:uppercase;}
+  .vf .v{font-size:14px;}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+  .tl-item{border-left:2px solid #E4E7EC;padding:0 0 14px 16px;margin-left:4px;position:relative;}
+  .tl-item::before{content:"";position:absolute;left:-5px;top:2px;width:8px;height:8px;border-radius:50%;background:#00814F;}
+  .tl-title{font-weight:700;font-size:13px;}
+  .tl-date{font-size:11.5px;color:#8A93A3;}
+  .tl-desc{font-size:12.5px;color:#4B5262;margin-top:3px;}
+  .note-card{border:1px solid #E4E7EC;border-radius:10px;padding:10px 12px;margin-bottom:8px;font-size:13px;}
+  .note-date{font-size:11px;color:#8A93A3;margin-bottom:4px;}
+  .foot-note{font-size:11.5px;color:#8A93A3;text-align:center;margin-top:20px;}
+  @media (max-width:560px){ .grid2{grid-template-columns:1fr;} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card" id="login-card">
+    <h1>Proceso compartido — OCID PROCESOS</h1>
+    <p class="sub">Este enlace requiere una clave de acceso que te debió compartir la persona que te lo envió.</p>
+    <div id="err-box" class="err hidden"></div>
+    <label>Clave de acceso</label>
+    <input type="password" id="password" placeholder="Ingresa la clave">
+    <button id="btn-enter">Ver proceso</button>
+  </div>
+  <div id="content" class="hidden"></div>
+  <p class="foot-note">Esta es una vista de solo lectura. Los documentos adjuntos no están disponibles por este medio.</p>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script>
+const SUPABASE_URL = "https://ntuunyaqxqcylfthzfoo.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_fPHIAnrSmkoE0vkA9r7Hqw_pOJ0O5ca";
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+function esc(s){ return (s==null?"":String(s)).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function fmtDate(s){ if(!s) return "—"; const d=new Date(s+"T00:00:00"); if(isNaN(d)) return s; return d.toLocaleDateString("es-CO",{day:"2-digit",month:"short",year:"numeric"}); }
+
+const params = new URLSearchParams(location.search);
+const token = params.get("token");
+if(!token){
+  document.getElementById("err-box").textContent = "Este enlace no tiene un token válido.";
+  document.getElementById("err-box").classList.remove("hidden");
+  document.getElementById("btn-enter").disabled = true;
+}
+
+async function tryEnter(){
+  const password = document.getElementById("password").value;
+  const errBox = document.getElementById("err-box");
+  errBox.classList.add("hidden");
+  if(!password){ errBox.textContent = "Ingresa la clave."; errBox.classList.remove("hidden"); return; }
+  const { data, error } = await sb.rpc("get_shared_process", { p_token: token, p_password: password });
+  if(error){ errBox.textContent = "No se pudo abrir: " + error.message; errBox.classList.remove("hidden"); return; }
+  render(data);
+}
+document.getElementById("btn-enter").addEventListener("click", tryEnter);
+document.getElementById("password").addEventListener("keydown",(e)=>{ if(e.key==="Enter") tryEnter(); });
+
+function render(data){
+  document.getElementById("login-card").classList.add("hidden");
+  const content = document.getElementById("content");
+  content.classList.remove("hidden");
+  const p = data.process || {};
+  const actuaciones = data.actuaciones || [];
+  const personas = data.personas || [];
+  const notas = data.notas || [];
+  const docsNombres = data.documentos_nombres || [];
+
+  let html = `<div class="card">
+    <h1>${esc(p.radicado||"(sin radicado)")} <span class="badge">${esc(p.estado||"")}</span></h1>
+    <div class="grid2" style="margin-top:16px;">
+      <div class="vf"><div class="l">Investigado</div><div class="v">${esc(p.investigado||"—")}</div></div>
+      <div class="vf"><div class="l">${p.quejosoTipo==="Informante"?"Informante":"Quejoso"}</div><div class="v">${esc(p.quejoso||"—")}</div></div>
+      <div class="vf"><div class="l">Fecha de apertura</div><div class="v">${fmtDate(p.fechaApertura)}</div></div>
+      <div class="vf"><div class="l">Fecha de vencimiento</div><div class="v">${fmtDate(p.fechaVencimiento)}</div></div>
+      <div class="vf"><div class="l">Prioridad</div><div class="v">${esc(p.prioridad||"—")}</div></div>
+    </div>
+    ${p.observaciones?`<div class="vf"><div class="l">Observaciones</div><div class="v">${esc(p.observaciones)}</div></div>`:""}
+  </div>`;
+
+  html += `<div class="card"><div class="section-title">Actuaciones (${actuaciones.length})</div>`;
+  html += actuaciones.length? actuaciones.map(a=>`
+    <div class="tl-item"><div class="tl-title">${esc(a.titulo||"")}</div><div class="tl-date">${fmtDate(a.fecha)}${a.hora?" · "+esc(a.hora):""}</div>${a.descripcion?`<div class="tl-desc">${esc(a.descripcion)}</div>`:""}</div>`).join("")
+    : `<p style="color:#8A93A3;font-size:13px;">Sin actuaciones registradas.</p>`;
+  html += `</div>`;
+
+  html += `<div class="card"><div class="section-title">Personas relacionadas (${personas.length})</div>`;
+  html += personas.length? personas.map(pe=>`
+    <div class="vf"><div class="l">${esc(pe.rol||"")}</div><div class="v">${esc(pe.nombre||"")} ${pe.telefono?" · "+esc(pe.telefono):""}</div></div>`).join("")
+    : `<p style="color:#8A93A3;font-size:13px;">Sin personas registradas.</p>`;
+  html += `</div>`;
+
+  html += `<div class="card"><div class="section-title">Notas (${notas.length})</div>`;
+  html += notas.length? notas.map(n=>`
+    <div class="note-card"><div class="note-date">${new Date(n.fecha).toLocaleString("es-CO")}</div>${esc(n.content||"")}</div>`).join("")
+    : `<p style="color:#8A93A3;font-size:13px;">Sin notas.</p>`;
+  html += `</div>`;
+
+  if(docsNombres.length){
+    html += `<div class="card"><div class="section-title">Documentos adjuntos (solo nombres)</div>`;
+    html += docsNombres.map(n=>`<div class="vf"><div class="v">📄 ${esc(n)}</div></div>`).join("");
+    html += `<p style="color:#8A93A3;font-size:12px;">Para obtener estos archivos, contacta a la persona que te compartió este enlace.</p></div>`;
+  }
+
+  content.innerHTML = html;
+}
+</script>
+</body>
+</html>
