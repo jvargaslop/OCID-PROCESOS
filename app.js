@@ -167,8 +167,12 @@ async function loadMyProfile(){
   let { data: profile } = await sbClient.from("profiles").select("id,email,role").eq("id", user.id).maybeSingle();
   if(!profile){
     // Por si el trigger aún no creó el perfil (usuarios creados antes de correr schema_update_2.sql)
-    const { data: created } = await sbClient.from("profiles").insert({id:user.id, email:user.email, role:"user"}).select().maybeSingle().catch(()=>({data:null}));
-    profile = created || { id:user.id, email:user.email, role:"user" };
+    try{
+      const { data: created } = await sbClient.from("profiles").insert({id:user.id, email:user.email, role:"user"}).select().maybeSingle();
+      profile = created || { id:user.id, email:user.email, role:"user" };
+    }catch(err){
+      profile = { id:user.id, email:user.email, role:"user" };
+    }
   }
   STATE.me = profile;
   const roleBadge = document.getElementById("sb-user-role");
@@ -985,7 +989,9 @@ function bindResumenForm(p, id){
       try{
         const newId = await DB.add("processes", updated);
         if(STATE.me && STATE.me.id){
-          await sbClient.from("process_assignments").insert({process_id:newId, user_id:STATE.me.id}).select().maybeSingle().catch(()=>{});
+          try{
+            await sbClient.from("process_assignments").insert({process_id:newId, user_id:STATE.me.id});
+          }catch(assignErr){ /* no bloquea la creación del proceso si esto falla */ }
         }
         await logHistorial(newId, autoArchived? "Proceso creado y archivado automáticamente (Inhibitorio)" : "Proceso creado");
         toast(autoArchived? "Proceso archivado automáticamente (Inhibitorio)" : "Proceso creado","ok");
@@ -1054,7 +1060,8 @@ function openShareDialog(id){
       la persona necesitará el enlace Y la clave para poder verlo.
     </p>
     <div class="field"><label class="field-label">Clave de acceso para este enlace</label><input type="text" id="share-password" placeholder="Ej: idsn2026"></div>
-    <div class="field"><label class="field-label">Enlace de documentos (opcional — ej. carpeta de Google Drive)</label><input type="text" id="share-drive" placeholder="https://drive.google.com/..."></div>
+    <div class="field"><label class="field-label">Enlace del expediente (ej. Google Drive)</label><input type="text" id="share-link-expediente" placeholder="https://drive.google.com/..."></div>
+    <div class="field"><label class="field-label">Enlace de anexos (ej. Google Drive)</label><input type="text" id="share-link-anexos" placeholder="https://drive.google.com/..."></div>
     <div style="display:flex;justify-content:flex-end;gap:8px;"><button class="btn" id="share-cancel">Cancelar</button><button class="btn primary" id="share-create">Generar enlace</button></div>
     <div id="share-result" class="hidden" style="margin-top:16px;">
       <label class="field-label">Enlace para compartir</label>
@@ -1064,9 +1071,14 @@ function openShareDialog(id){
   overlay.querySelector("#share-cancel").addEventListener("click", ()=>overlay.remove());
   overlay.querySelector("#share-create").addEventListener("click", async ()=>{
     const password = overlay.querySelector("#share-password").value.trim();
-    const driveLink = overlay.querySelector("#share-drive").value.trim();
+    const linkExpediente = overlay.querySelector("#share-link-expediente").value.trim();
+    const linkAnexos = overlay.querySelector("#share-link-anexos").value.trim();
     if(!password || password.length<4){ toast("Escribe una clave de al menos 4 caracteres","err"); return; }
-    const { data: token, error } = await sbClient.rpc("create_share_link", { p_process_id:id, p_password:password, p_drive_link: driveLink||null });
+    const { data: token, error } = await sbClient.rpc("create_share_link", {
+      p_process_id:id, p_password:password,
+      p_enlace_expediente: linkExpediente||null,
+      p_enlace_anexos: linkAnexos||null,
+    });
     if(error){ toast("No se pudo generar el enlace: "+error.message,"err"); return; }
     const baseUrl = location.origin + location.pathname.replace(/index\.html$/,"");
     const url = `${baseUrl}compartido.html?token=${token}`;

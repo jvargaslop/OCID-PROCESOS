@@ -82,9 +82,12 @@ function render(data){
   const p = data.process || {};
   const actuaciones = data.actuaciones || [];
   const personas = data.personas || [];
-  const notas = data.notas || [];
-  const docsNombres = data.documentos_nombres || [];
-  const driveLink = data.documentos_enlace || "";
+  const enlaceExpediente = data.enlace_expediente || "";
+  const enlaceAnexos = data.enlace_anexos || "";
+
+  function safeUrl(u){
+    try{ const x = new URL(u); return (x.protocol==="http:"||x.protocol==="https:") ? x.href : "#"; }catch(e){ return "#"; }
+  }
 
   let html = `<div class="card">
     <h1>${esc(p.radicado||"(sin radicado)")} <span class="badge">${esc(p.estado||"")}</span></h1>
@@ -110,23 +113,10 @@ function render(data){
     : `<p style="color:#8A93A3;font-size:13px;">Sin personas registradas.</p>`;
   html += `</div>`;
 
-  html += `<div class="card"><div class="section-title">Notas (${notas.length})</div>`;
-  html += notas.length? notas.map(n=>`
-    <div class="note-card"><div class="note-date">${new Date(n.fecha).toLocaleString("es-CO")}</div>${esc(n.content||"")}</div>`).join("")
-    : `<p style="color:#8A93A3;font-size:13px;">Sin notas.</p>`;
-  html += `</div>`;
-
-  if(docsNombres.length || driveLink){
-    html += `<div class="card"><div class="section-title">Documentos adjuntos</div>`;
-    if(driveLink){
-      let safeHref = "#";
-      try{ const u = new URL(driveLink); if(u.protocol==="http:"||u.protocol==="https:") safeHref = u.href; }catch(e){}
-      html += `<p style="font-size:13px;margin-bottom:10px;">📎 <a href="${safeHref}" target="_blank" rel="noopener noreferrer">Abrir carpeta/enlace de documentos</a></p>`;
-    }
-    if(docsNombres.length){
-      html += docsNombres.map(n=>`<div class="vf"><div class="v">📄 ${esc(n)}</div></div>`).join("");
-    }
-    if(!driveLink) html += `<p style="color:#8A93A3;font-size:12px;">Para obtener estos archivos, contacta a la persona que te compartió este enlace.</p>`;
+  if(enlaceExpediente || enlaceAnexos){
+    html += `<div class="card"><div class="section-title">Documentos</div>`;
+    if(enlaceExpediente) html += `<p style="font-size:13px;margin-bottom:10px;">📎 <a href="${safeUrl(enlaceExpediente)}" target="_blank" rel="noopener noreferrer">Abrir expediente completo</a></p>`;
+    if(enlaceAnexos) html += `<p style="font-size:13px;margin-bottom:0;">📎 <a href="${safeUrl(enlaceAnexos)}" target="_blank" rel="noopener noreferrer">Abrir anexos</a></p>`;
     html += `</div>`;
   }
 
