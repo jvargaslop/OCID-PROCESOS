@@ -247,7 +247,6 @@ function businessDaysBetween(from,to){
    3. ESTADO GLOBAL Y CONSTANTES
    ============================================================ */
 const ESTADOS = ["Indagación previa","Investigación disciplinaria","Inhibitorio","Acumulado","Archivado"];
-const KANBAN_COLS = ["Indagación previa","Investigación disciplinaria","Acumulado","Archivado"];
 const FOLDERS = ["Expediente Completo","Anexos"];
 const TERM_PLANTILLAS = [
   {nombre:"Pruebas", dias:10},{nombre:"Notificación personal", dias:5},{nombre:"Edicto", dias:3}
@@ -512,24 +511,51 @@ async function renderMiniCalendar(){
 /* ============================================================
    8. KANBAN
    ============================================================ */
-function renderKanban(){
+async function renderKanban(){
   const tb = document.getElementById("kanban-toolbar");
-  tb.innerHTML = `<div style="font-size:12.5px;color:var(--text-muted);">Arrastra una tarjeta para cambiar el estado del proceso.</div>`;
   const board = document.getElementById("kanban-board");
+  const isAdmin = STATE.me && STATE.me.role === "admin";
+
+  if(!isAdmin){
+    tb.innerHTML = "";
+    board.innerHTML = `<div class="empty-hint">El tablero de asignación es solo para administradores. Aquí ves los procesos que te asignaron en la vista Tabla o Dashboard.</div>`;
+    return;
+  }
+
+  tb.innerHTML = `<div style="font-size:12.5px;color:var(--text-muted);">Arrastra una tarjeta a un usuario para asignarle ese proceso (reemplaza cualquier asignación anterior de esa tarjeta). Suéltala en "Sin asignar" para quitarle todos los responsables.</div>`;
+  board.innerHTML = `<div class="empty-hint">Cargando asignaciones...</div>`;
+
+  const [{ data: profiles, error: perr }, { data: asigns, error: aerr }] = await Promise.all([
+    sbClient.from("profiles").select("id,email,role").order("email"),
+    sbClient.from("process_assignments").select("process_id,user_id"),
+  ]);
+  if(perr || aerr){ board.innerHTML = `<div class="empty-hint">No se pudo cargar el tablero de asignación.</div>`; return; }
+
+  // processId -> [userId, ...]
+  const byProcess = {};
+  (asigns||[]).forEach(a=>{ (byProcess[a.process_id]=byProcess[a.process_id]||[]).push(a.user_id); });
+
+  const columns = [{ id:"__unassigned__", label:"Sin asignar" }, ...(profiles||[]).map(p=>({ id:p.id, label:p.email, role:p.role }))];
+
   board.innerHTML = "";
-  KANBAN_COLS.forEach(col=>{
-    const items = STATE.processes.filter(p=>p.estado===col);
+  columns.forEach(col=>{
+    const items = STATE.processes.filter(p=>{
+      const assignees = byProcess[p.id] || [];
+      if(col.id==="__unassigned__") return assignees.length===0;
+      return assignees[0] === col.id; // se muestra en la columna del primer responsable
+    });
     const colEl = document.createElement("div");
-    colEl.className="kcol"; colEl.dataset.col=col;
-    colEl.innerHTML = `<div class="kcol-head">${esc(col)}<span class="n">${items.length}</span></div>`;
+    colEl.className="kcol"; colEl.dataset.col=col.id;
+    colEl.innerHTML = `<div class="kcol-head">${esc(col.label)}${col.role==="admin"?' <span class="badge tag" style="font-size:9px;">admin</span>':""}<span class="n">${items.length}</span></div>`;
     items.forEach(p=>{
+      const assignees = byProcess[p.id] || [];
       const c = document.createElement("div");
       c.className="kcard"; c.draggable=true; c.dataset.id=p.id;
       const overdue = getOverdueTerms(p).length;
       c.innerHTML = `
         <div class="kc-top"><span class="rad">${esc(p.radicado||"(sin radicado)")}</span>${prioBadge(p.prioridad)}</div>
         <div class="who">${esc(p.investigado||"Sin investigado")}</div>
-        <div class="kc-tags">${overdue?`<span class="badge priority-alta">${overdue} vencido${overdue>1?'s':''}</span>`:""}</div>`;
+        <div class="kc-tags">${estadoBadge(p)}${overdue?`<span class="badge priority-alta">${overdue} vencido${overdue>1?'s':''}</span>`:""}${assignees.length>1?`<span class="badge tag">+${assignees.length-1} más</span>`:""}</div>`;
       c.addEventListener("dragstart",()=>{ c.classList.add("dragging"); });
       c.addEventListener("dragend",()=>{ c.classList.remove("dragging"); });
       c.addEventListener("click",(e)=>{ if(!c.classList.contains("dragging")) openProcessModal(p.id); });
@@ -542,19 +568,21 @@ function renderKanban(){
       const dragging = document.querySelector(".kcard.dragging");
       if(!dragging) return;
       const id = Number(dragging.dataset.id);
+      const currentAssignees = byProcess[id] || [];
+      if(col.id!=="__unassigned__" && currentAssignees.length===1 && currentAssignees[0]===col.id) return;
+      if(col.id==="__unassigned__" && currentAssignees.length===0) return;
       const p = STATE.processes.find(x=>x.id===id);
-      if(p && p.estado!==col){
-        const prev = p.estado;
-        p.estado = col; p.actualizadoEn = new Date().toISOString();
-        try{
-          await DB.put("processes", p);
-          await logHistorial(id, `Estado cambiado de "${prev}" a "${col}" (kanban)`);
-          toast("Estado actualizado","ok");
-          await refreshAll();
-        }catch(err){
-          p.estado = prev;
-          toast("No se pudo actualizar el estado: "+(err.message||err),"err");
+      try{
+        await sbClient.from("process_assignments").delete().eq("process_id", id);
+        if(col.id!=="__unassigned__"){
+          const { error } = await sbClient.from("process_assignments").insert({process_id:id, user_id:col.id});
+          if(error) throw error;
         }
+        await logHistorial(id, col.id==="__unassigned__" ? "Proceso desasignado (kanban)" : `Proceso asignado a ${col.label} (kanban)`);
+        toast("Asignación actualizada","ok");
+        await refreshAll();
+      }catch(err){
+        toast("No se pudo actualizar la asignación: "+(err.message||err),"err");
       }
     });
     board.appendChild(colEl);
@@ -591,7 +619,7 @@ function filteredProcesses(){
   if(f.anio.size) arr = arr.filter(p=> p.fechaApertura && f.anio.has(String(new Date(p.fechaApertura+"T00:00:00").getFullYear())));
   if(STATE.search){
     const q = STATE.search.toLowerCase();
-    arr = arr.filter(p=> [p.radicado,p.investigado,p.quejoso,p.observaciones].some(v=> (v||"").toLowerCase().includes(q)));
+    arr = arr.filter(p=> [p.radicado,p.investigado,p.quejoso,p.resumen,p.observaciones].some(v=> (v||"").toLowerCase().includes(q)));
   }
   const {col,dir} = STATE.sort;
   arr.sort((a,b)=> (String(a[col]||"")).localeCompare(String(b[col]||""))*dir);
@@ -755,15 +783,21 @@ function renderBarGroup(containerId, counts){
     <div class="bar-row"><div class="lbl" title="${esc(k)}">${esc(k)}</div><div class="bar-track"><div class="bar-fill" style="width:${(v/max*100)}%"></div></div><div class="val">${v}</div></div>`).join("")
     : `<div class="empty-hint">Sin datos aún.</div>`;
 }
-function renderStats(){
+async function renderStats(){
   const ps = STATE.processes;
-  const byEstado={}, byAnio={};
+  const byEstado={}, byAnio={}, byPrioridad={};
+  let vencidos=0, proximos=0;
   ps.forEach(p=>{
     byEstado[p.estado||"Sin estado"]=(byEstado[p.estado||"Sin estado"]||0)+1;
     if(p.fechaApertura){ const y=new Date(p.fechaApertura+"T00:00:00").getFullYear(); byAnio[y]=(byAnio[y]||0)+1; }
+    byPrioridad[p.prioridad||"Sin prioridad"]=(byPrioridad[p.prioridad||"Sin prioridad"]||0)+1;
+    if(getOverdueTerms(p).length) vencidos++;
+    else if(getUpcomingTerms(p,7).length) proximos++;
   });
   renderBarGroup("stat-estado", byEstado);
   renderBarGroup("stat-anio", byAnio);
+  renderBarGroup("stat-prioridad", byPrioridad);
+
   const archivados = ps.filter(p=>p.estado==="Archivado");
   let avgDays = "—";
   const closedWithDates = archivados.filter(p=>p.fechaApertura);
@@ -771,10 +805,42 @@ function renderStats(){
     const totalDays = closedWithDates.reduce((s,p)=> s + Math.abs((new Date(p.actualizadoEn||Date.now())-new Date(p.fechaApertura+"T00:00:00"))/86400000), 0);
     avgDays = Math.round(totalDays/closedWithDates.length)+" días";
   }
+
+  // KPIs principales arriba
+  const kpis = [
+    {lbl:"Total procesos", val:ps.length},
+    {lbl:"Activos", val:ps.length-archivados.length},
+    {lbl:"Vencidos ahora", val:vencidos},
+    {lbl:"Vencen en 7 días", val:proximos},
+    {lbl:"Archivados", val:archivados.length},
+  ];
+  document.getElementById("stat-kpi-row").innerHTML = kpis.map(k=>`<div class="card kpi"><div class="lbl">${esc(k.lbl)}</div><div class="val">${k.val}</div></div>`).join("");
+
   document.getElementById("stat-resumen").innerHTML = `
     Total histórico: <b>${ps.length}</b> procesos.<br>
     Activos: <b>${ps.length-archivados.length}</b> · Archivados: <b>${archivados.length}</b>.<br>
+    Con términos vencidos ahora mismo: <b>${vencidos}</b> · Por vencer en 7 días: <b>${proximos}</b>.<br>
     Tiempo promedio estimado hasta archivo: <b>${avgDays}</b>.`;
+
+  // Carga de trabajo por usuario (solo admin, porque solo el admin puede ver
+  // las asignaciones de todo el equipo — a un usuario normal RLS solo le
+  // deja ver sus propias asignaciones).
+  const cargaCard = document.getElementById("stat-carga-card");
+  if(STATE.me && STATE.me.role==="admin"){
+    const [{ data: profiles }, { data: asigns }] = await Promise.all([
+      sbClient.from("profiles").select("id,email"),
+      sbClient.from("process_assignments").select("process_id,user_id"),
+    ]);
+    const emailById = {}; (profiles||[]).forEach(p=> emailById[p.id]=p.email);
+    const countByUser = {};
+    (asigns||[]).forEach(a=>{ const email = emailById[a.user_id]||"desconocido"; countByUser[email]=(countByUser[email]||0)+1; });
+    const sinAsignar = ps.filter(p=> !(asigns||[]).some(a=>a.process_id===p.id)).length;
+    if(sinAsignar>0) countByUser["Sin asignar"] = sinAsignar;
+    cargaCard.classList.remove("hidden");
+    renderBarGroup("stat-carga", countByUser);
+  } else {
+    cargaCard.classList.add("hidden");
+  }
 }
 
 /* ============================================================
@@ -793,7 +859,7 @@ document.addEventListener("keydown",(e)=>{
 paletteInput.addEventListener("input", ()=> renderPaletteResults(paletteInput.value));
 function renderPaletteResults(q){
   q = q.toLowerCase();
-  const res = STATE.processes.filter(p=> !q || [p.radicado,p.investigado,p.quejoso,p.observaciones].some(v=>(v||"").toLowerCase().includes(q))).slice(0,20);
+  const res = STATE.processes.filter(p=> !q || [p.radicado,p.investigado,p.quejoso,p.resumen,p.observaciones].some(v=>(v||"").toLowerCase().includes(q))).slice(0,20);
   const el = document.getElementById("palette-results");
   el.innerHTML = res.length? res.map(p=>`<div class="pal-item" data-id="${p.id}"><span class="dot-ind ${getOverdueTerms(p).length?'red':'green'}"></span><div><div class="t1">${esc(p.radicado||"(sin radicado)")} · ${esc(p.investigado||"")}</div><div class="t2">${esc(p.estado||"")}</div></div></div>`).join("") : `<div class="empty-hint">Sin coincidencias.</div>`;
   el.querySelectorAll(".pal-item").forEach(it=> it.addEventListener("click",()=>{ closePalette(); openProcessModal(Number(it.dataset.id)); }));
@@ -811,7 +877,7 @@ document.getElementById("btn-new-process").addEventListener("click", ()=> openPr
 function emptyProcess(){
   return { radicado:"", investigado:"", quejoso:"", quejosoTipo:"Quejoso",
     fechaApertura: todayStr(), fechaVencimiento:"", estado:ESTADOS[0],
-    observaciones:"", prioridad:"Media", terminos:[], favorito:false,
+    resumen:"", observaciones:"", prioridad:"Media", terminos:[], favorito:false,
     creadoEn:new Date().toISOString(), actualizadoEn:new Date().toISOString() };
 }
 
@@ -904,6 +970,7 @@ function resumenViewHTML(p){
       ${fieldView("Estado", p.estado)}
       ${fieldView("Prioridad", p.prioridad)}
     </div>
+    ${fieldView("Resumen del proceso", p.resumen)}
     ${fieldView("Observaciones", p.observaciones)}
     <div style="margin-top:14px;font-size:11.5px;color:var(--text-muted);">Última actualización: ${p.actualizadoEn? new Date(p.actualizadoEn).toLocaleString("es-CO") : "—"}</div>`;
 }
@@ -937,6 +1004,7 @@ function resumenFormHTML(p){
       </div>
       <div class="field"><label class="field-label">Prioridad</label><select id="f-prioridad">${["Alta","Media","Baja"].map(x=>`<option ${p.prioridad===x?"selected":""}>${x}</option>`).join("")}</select></div>
     </div>
+    <div class="field"><label class="field-label">Resumen del proceso</label><textarea id="f-resumen" rows="3" placeholder="Breve descripción del caso, para entenderlo de un vistazo">${esc(p.resumen)}</textarea></div>
     <div class="field"><label class="field-label">Observaciones</label><textarea id="f-observaciones" rows="4">${esc(p.observaciones)}</textarea></div>
     <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px;">
       <button class="btn" id="btn-cancel-form">Cancelar</button>
@@ -964,6 +1032,7 @@ function bindResumenForm(p, id){
       investigado:val("investigado"), quejoso:val("quejoso"), quejosoTipo:val("quejosoTipo"),
       fechaApertura:val("fechaApertura"), fechaVencimiento:val("fechaVencimiento"), estado:val("estado"),
       prioridad:val("prioridad"),
+      resumen:document.getElementById("f-resumen").value.trim(),
       observaciones:document.getElementById("f-observaciones").value.trim(),
       actualizadoEn:new Date().toISOString()
     };
@@ -977,11 +1046,24 @@ function bindResumenForm(p, id){
       // si el proceso cambia de estado manualmente, se limpia el motivo de archivo automático
       updated.motivoArchivo = "";
     }
+    // Si el estado cambió (se pasó a una nueva etapa procesal), los términos
+    // manuales que quedaron pendientes de la etapa anterior ya no aplican:
+    // se marcan como cumplidos para que no sigan apareciendo como "vencidos"
+    // en la tabla y las alertas, arrastrando al proceso con ellos.
+    let terminosAutoCompletados = 0;
+    if(id && p.estado !== updated.estado && Array.isArray(updated.terminos) && updated.terminos.length){
+      updated.terminos = updated.terminos.map(t=>{
+        if(!t.cumplido){ terminosAutoCompletados++; return { ...t, cumplido:true }; }
+        return t;
+      });
+    }
     if(id){
       try{
         await DB.put("processes", updated);
-        await logHistorial(id, autoArchived? "Estado marcado como Inhibitorio → proceso archivado automáticamente" : "Información general actualizada");
-        toast(autoArchived? "Proceso archivado automáticamente (Inhibitorio)" : "Proceso guardado","ok");
+        let histMsg = autoArchived? "Estado marcado como Inhibitorio → proceso archivado automáticamente" : "Información general actualizada";
+        if(terminosAutoCompletados>0) histMsg += ` (${terminosAutoCompletados} término(s) de la etapa anterior marcados como cumplidos automáticamente)`;
+        await logHistorial(id, histMsg);
+        toast(autoArchived? "Proceso archivado automáticamente (Inhibitorio)" : (terminosAutoCompletados>0? `Proceso guardado (${terminosAutoCompletados} término(s) vencidos de la etapa anterior se marcaron como cumplidos)` : "Proceso guardado"),"ok");
         await refreshAll();
         openProcessModal(id);
       }catch(err){ toast("No se pudo guardar: "+(err.message||err),"err"); }
