@@ -444,3 +444,9 @@ textarea.notes-area{min-height:220px;resize:vertical;font-family:var(--font-mono
   .toolbar{gap:6px;}
   .toolbar input[type=text]{max-width:100% !important;flex:1 1 100%;}
 }
+
+.dash-scope-row{display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap;}
+.scope-toggle{display:inline-flex;background:var(--surface-2);border:1px solid var(--border);border-radius:10px;padding:3px;gap:2px;}
+.scope-toggle button{border:none;background:transparent;color:var(--text-2);font-family:inherit;font-size:12.5px;font-weight:700;padding:6px 12px;border-radius:8px;cursor:pointer;}
+.scope-toggle button.active{background:var(--bg-elevated);color:var(--accent);box-shadow:var(--shadow-sm);}
+.scope-caption{font-size:12px;color:var(--text-muted);}

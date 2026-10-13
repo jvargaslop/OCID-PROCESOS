@@ -155,7 +155,7 @@ function wireRealtimeSync(){
   REALTIME_WIRED = true;
   let debounceTimer = null;
   const debouncedRefresh = ()=>{ clearTimeout(debounceTimer); debounceTimer = setTimeout(()=>refreshAll(), 600); };
-  const tables = ["processes","actuaciones","documentos","personas","notas_items","tareas","historial"];
+  const tables = ["processes","actuaciones","documentos","personas","notas_items","tareas","historial","process_assignments"];
   const channel = sbClient.channel("ocid-realtime");
   tables.forEach(t=> channel.on("postgres_changes", {event:"*", schema:"public", table:t}, debouncedRefresh));
   channel.subscribe();
@@ -184,6 +184,7 @@ async function onAuthReady(){
   if(!session){ showLogin(); return; }
   document.getElementById("sb-user-email").textContent = session.user.email;
   await loadMyProfile();
+  initDashScope();
   wireRealtimeSync();
   await refreshAll();
 }
@@ -246,7 +247,7 @@ function businessDaysBetween(from,to){
 /* ============================================================
    3. ESTADO GLOBAL Y CONSTANTES
    ============================================================ */
-const ESTADOS = ["Indagación previa","Investigación disciplinaria","Inhibitorio","Acumulado","Archivado"];
+const ESTADOS = ["Indagación previa","Investigación disciplinaria","Pliego de cargos","Inhibitorio","Acumulado","Archivado"];
 const FOLDERS = ["Expediente Completo","Anexos"];
 const TERM_PLANTILLAS = [
   {nombre:"Pruebas", dias:10},{nombre:"Notificación personal", dias:5},{nombre:"Edicto", dias:3}
@@ -263,6 +264,8 @@ let STATE = {
   currentProcessId:null,
   currentTab:"resumen",
   resumenEditMode:false,
+  dashScope:"admin",          // "admin" (todos los procesos) | "personal" (solo los asignados a mí)
+  myAssignedIds:new Set(),    // ids de procesos asignados al usuario logueado
   me:null, // {id, email, role} del usuario logueado, se llena en loadMyProfile()
 };
 
@@ -282,10 +285,51 @@ async function logHistorial(processId, cambio){
 /* ============================================================
    4. CARGA Y REFRESCO
    ============================================================ */
+async function loadMyAssignments(){
+  STATE.myAssignedIds = new Set();
+  if(!STATE.me || !STATE.me.id) return;
+  const { data, error } = await sbClient.from("process_assignments").select("process_id").eq("user_id", STATE.me.id);
+  if(!error && data) data.forEach(a=> STATE.myAssignedIds.add(a.process_id));
+}
 async function reloadProcesses(){
   STATE.processes = await DB.all("processes");
+  await loadMyAssignments();
   renderSidebarCounts();
 }
+
+// Procesos que muestra el Dashboard según el alcance elegido.
+// Un usuario normal ya solo recibe sus procesos asignados (por RLS), así que
+// el filtro "personal" solo cambia algo para el administrador.
+function scopedProcesses(){
+  const isAdmin = STATE.me && STATE.me.role === "admin";
+  if(isAdmin && STATE.dashScope === "personal") return STATE.processes.filter(p=> STATE.myAssignedIds.has(p.id));
+  return STATE.processes;
+}
+function updateScopeToggleUI(){
+  const isAdmin = STATE.me && STATE.me.role === "admin";
+  const wrap = document.getElementById("dash-scope-toggle");
+  if(!wrap) return;
+  wrap.classList.toggle("hidden", !isAdmin);
+  wrap.querySelectorAll("button").forEach(b=> b.classList.toggle("active", b.dataset.scope === STATE.dashScope));
+  const cap = document.getElementById("dash-scope-caption");
+  if(cap){
+    if(!isAdmin) cap.textContent = "Tus procesos asignados";
+    else cap.textContent = STATE.dashScope === "personal" ? "Solo los procesos asignados a ti" : "Todos los procesos del sistema";
+  }
+}
+function initDashScope(){
+  const isAdmin = STATE.me && STATE.me.role === "admin";
+  let saved = null;
+  try{ saved = localStorage.getItem("ocid_dash_scope"); }catch(e){}
+  STATE.dashScope = (isAdmin && saved === "personal") ? "personal" : "admin";
+  updateScopeToggleUI();
+}
+document.querySelectorAll("#dash-scope-toggle button").forEach(b=> b.addEventListener("click", ()=>{
+  STATE.dashScope = b.dataset.scope;
+  try{ localStorage.setItem("ocid_dash_scope", STATE.dashScope); }catch(e){}
+  updateScopeToggleUI();
+  renderDashboard();
+}));
 async function refreshAll(){
   await reloadProcesses();
   renderCurrentView();
@@ -385,7 +429,8 @@ function getUpcomingTerms(p, days){
    7. DASHBOARD
    ============================================================ */
 function renderDashboard(){
-  const ps = STATE.processes;
+  const ps = scopedProcesses();
+  const scopeIds = new Set(ps.map(p=>p.id));
   const archived = ps.filter(p=>p.estado==="Archivado");
   const activos = ps.filter(p=>p.estado!=="Archivado");
   const investigacion = ps.filter(p=>p.estado==="Investigación disciplinaria");
@@ -418,10 +463,11 @@ function renderDashboard(){
   alertsEl.querySelectorAll("[data-open]").forEach(el=> el.addEventListener("click",()=>openProcessModal(Number(el.dataset.open))));
 
   // distribución de procesos (pizza: archivados, investigación, indagación)
-  renderDistribucionPie(archived.length, investigacion.length, indagacion.length, ps.length);
+  renderDistribucionPie(archived.length, investigacion.length, indagacion.length, ps.length, ps.filter(p=>p.estado==="Pliego de cargos").length);
 
   // actividad reciente (compacta)
   DB.all("historial").then(all=>{
+    all = all.filter(h=> scopeIds.has(h.processId));
     all.sort((a,b)=> b.fecha.localeCompare(a.fecha));
     const el = document.getElementById("recent-activity");
     const top = all.slice(0,5);
@@ -446,14 +492,16 @@ function renderDashboard(){
   recEl.querySelectorAll("[data-open]").forEach(el=> el.addEventListener("click",()=>openProcessModal(Number(el.dataset.open))));
 }
 
-function renderDistribucionPie(nArchivados, nInvestigacion, nIndagacion, total){
+function renderDistribucionPie(nArchivados, nInvestigacion, nIndagacion, total, nPliego){
+  nPliego = nPliego || 0;
   const el = document.getElementById("pie-distribucion");
   if(!total){ el.innerHTML = `<div class="empty-hint">Crea procesos para ver la distribución.</div>`; return; }
-  const otros = Math.max(0, total - nArchivados - nInvestigacion - nIndagacion);
+  const otros = Math.max(0, total - nArchivados - nInvestigacion - nIndagacion - nPliego);
   const segments = [
     {label:"Archivados", value:nArchivados, color:"var(--text-muted)"},
     {label:"Investigación", value:nInvestigacion, color:"var(--accent)"},
     {label:"Indagación", value:nIndagacion, color:"var(--warning)"},
+    {label:"Pliego de cargos", value:nPliego, color:"var(--brand-purple)"},
   ];
   if(otros>0) segments.push({label:"Otros estados", value:otros, color:"var(--border)"});
   const R=78, CX=86, CY=86;
@@ -485,7 +533,9 @@ function renderDistribucionPie(nArchivados, nInvestigacion, nIndagacion, total){
 }
 
 async function renderMiniCalendar(){
-  const acts = await DB.all("actuaciones");
+  const scoped = scopedProcesses();
+  const scopeIds = new Set(scoped.map(p=>p.id));
+  const acts = (await DB.all("actuaciones")).filter(a=> scopeIds.has(a.processId));
   const now = new Date(); const y=now.getFullYear(), m=now.getMonth();
   const first = new Date(y,m,1); const startWd = first.getDay();
   const daysInMonth = new Date(y,m+1,0).getDate();
@@ -493,7 +543,7 @@ async function renderMiniCalendar(){
   ["D","L","M","X","J","V","S"].forEach(d=> html+=`<div class="cal-dow">${d}</div>`);
   for(let i=0;i<startWd;i++) html+=`<div class="cal-cell other"></div>`;
   const termsByDay = {};
-  STATE.processes.forEach(p=> getAllTerms(p).forEach(t=>{ if(!t.cumplido && t.fechaVence){ (termsByDay[t.fechaVence]=termsByDay[t.fechaVence]||[]).push(t); } }));
+  scoped.forEach(p=> getAllTerms(p).forEach(t=>{ if(!t.cumplido && t.fechaVence){ (termsByDay[t.fechaVence]=termsByDay[t.fechaVence]||[]).push(t); } }));
   const actsByDay = {};
   acts.forEach(a=>{ (actsByDay[a.fecha]=actsByDay[a.fecha]||[]).push(a); });
   for(let d=1; d<=daysInMonth; d++){
@@ -1820,6 +1870,7 @@ async function init(){
   } else {
     document.getElementById("sb-user-email").textContent = session.user.email;
     await loadMyProfile();
+  initDashScope();
     const themeMeta = await DB.get("meta","theme").catch(()=>null);
     if(themeMeta && themeMeta.value==="dark"){ document.documentElement.setAttribute("data-theme","dark"); document.getElementById("theme-toggle").querySelector(".dot").textContent="☀"; }
     wireRealtimeSync();
