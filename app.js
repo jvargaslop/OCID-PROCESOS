@@ -15,6 +15,11 @@ const DOCS_BUCKET = "documentos";
 
 const sbClient = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
+// ¿Llegó por el enlace del correo de "olvidé mi contraseña"? Supabase borra ese dato de la
+// dirección al procesarlo, por eso se detecta aquí, al inicio (y también por el evento).
+let RECOVERY_MODE = /[#&?]type=recovery/.test(location.hash + location.search);
+sbClient.auth.onAuthStateChange((event)=>{ if(event === "PASSWORD_RECOVERY") RECOVERY_MODE = true; });
+
 // Nombre de "store" (como en IndexedDB) -> nombre real de la tabla en Postgres
 const STORE_TABLE = {
   processes: "processes",
@@ -139,10 +144,84 @@ document.getElementById("login-password").addEventListener("keydown",(e)=>{ if(e
 document.getElementById("btn-forgot-password").addEventListener("click", async ()=>{
   const email = document.getElementById("login-email").value.trim();
   if(!email){ toast("Escribe tu correo arriba primero","err"); return; }
-  const { error } = await sbClient.auth.resetPasswordForEmail(email);
+  const { error } = await sbClient.auth.resetPasswordForEmail(email, { redirectTo: location.origin + location.pathname.replace(/index\.html$/, "") });
   if(error){ toast("No se pudo enviar el correo: "+error.message,"err"); return; }
   toast("Te enviamos un correo para restablecer tu contraseña","ok");
 });
+/* ============================================================
+   CAMBIO DE CONTRASEÑA
+   - Normal: el usuario con sesión escribe su contraseña actual + la nueva.
+   - Recuperación: llegó desde el enlace del correo; solo define la nueva.
+   ============================================================ */
+function translateAuthError(msg){
+  const m = String(msg||"");
+  if(/different from the old/i.test(m)) return "La nueva contraseña debe ser diferente a la actual.";
+  if(/at least \d+ characters/i.test(m)) return "La contraseña es demasiado corta para las reglas del sistema. Usa una más larga.";
+  if(/weak|easy to guess|pwned|compromised/i.test(m)) return "Esa contraseña es muy común o apareció en filtraciones. Elige otra más segura.";
+  if(/reauthentication|recently logged in/i.test(m)) return "Por seguridad, cierra sesión, vuelve a entrar y repite el cambio.";
+  if(/session missing|not authenticated|jwt/i.test(m)) return "Tu sesión venció. Vuelve a iniciar sesión.";
+  if(/rate limit|too many/i.test(m)) return "Demasiados intentos. Espera unos minutos e inténtalo de nuevo.";
+  return "No se pudo cambiar la contraseña: " + m;
+}
+
+function openPasswordDialog(opts = {}){
+  const recovery = !!opts.recovery;
+  const overlay = smallModal(recovery ? "Crea tu nueva contraseña" : "Cambiar contraseña", `
+    <p style="font-size:12.5px;color:var(--text-muted);line-height:1.6;margin-top:0;">
+      ${recovery ? "Elige la contraseña con la que vas a entrar de ahora en adelante." : "Por seguridad, escribe tu contraseña actual para confirmar que eres tú."}
+    </p>
+    ${recovery ? "" : `<div class="field"><label class="field-label">Contraseña actual</label><input type="password" id="pw-current" autocomplete="current-password"></div>`}
+    <div class="field"><label class="field-label">Nueva contraseña</label><input type="password" id="pw-new" autocomplete="new-password" placeholder="Mínimo 8 caracteres"></div>
+    <div class="field"><label class="field-label">Repite la nueva contraseña</label><input type="password" id="pw-new2" autocomplete="new-password"></div>
+    <div class="field" style="display:flex;align-items:center;gap:8px;">
+      <input type="checkbox" id="pw-show" style="width:auto;"><label for="pw-show" style="font-size:12.5px;">Mostrar contraseñas</label>
+    </div>
+    <div id="pw-error" class="login-error hidden"></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;">
+      ${recovery ? "" : `<button class="btn" id="pw-cancel">Cancelar</button>`}
+      <button class="btn primary" id="pw-save">${recovery ? "Guardar y continuar" : "Cambiar contraseña"}</button>
+    </div>`, { locked: recovery });
+
+  const $ = (id)=> overlay.querySelector("#"+id);
+  const box = $("pw-error"), saveBtn = $("pw-save");
+  const fail = (msg)=>{ box.textContent = msg; box.classList.remove("hidden"); };
+  if($("pw-cancel")) $("pw-cancel").addEventListener("click", ()=>overlay.remove());
+  $("pw-show").addEventListener("change", (e)=>{
+    overlay.querySelectorAll('input[id^="pw-"]:not([type=checkbox])').forEach(i=> i.type = e.target.checked ? "text" : "password");
+  });
+
+  saveBtn.addEventListener("click", async ()=>{
+    box.classList.add("hidden");
+    const current = $("pw-current") ? $("pw-current").value : "";
+    const pw = $("pw-new").value, pw2 = $("pw-new2").value;
+    if(!recovery && !current) return fail("Escribe tu contraseña actual.");
+    if(pw.length < 8) return fail("La nueva contraseña debe tener al menos 8 caracteres.");
+    if(pw !== pw2) return fail("Las contraseñas nuevas no coinciden.");
+    if(!recovery && pw === current) return fail("La nueva contraseña debe ser diferente a la actual.");
+    saveBtn.disabled = true;
+    try{
+      if(!recovery){
+        // se confirma la contraseña actual volviendo a iniciar sesión con ella
+        let email = STATE.me && STATE.me.email;
+        if(!email){ const { data:{ user } } = await sbClient.auth.getUser(); email = user && user.email; }
+        const { error: reErr } = await sbClient.auth.signInWithPassword({ email, password: current });
+        if(reErr) return fail("La contraseña actual no es correcta.");
+      }
+      const { error } = await sbClient.auth.updateUser({ password: pw });
+      if(error) return fail(translateAuthError(error.message));
+      toast("Contraseña actualizada","ok");
+      if(recovery){ RECOVERY_MODE = false; history.replaceState(null, "", location.pathname + location.search.replace(/[?&]type=recovery/,"")); }
+      overlay.remove();
+    }catch(err){
+      fail(translateAuthError(err && err.message ? err.message : err));
+    }finally{
+      saveBtn.disabled = false;
+    }
+  });
+  setTimeout(()=>{ const f = $("pw-current") || $("pw-new"); if(f) f.focus(); }, 0);
+}
+document.getElementById("btn-password").addEventListener("click", ()=> openPasswordDialog());
+
 async function doLogout(){
   await sbClient.auth.signOut();
   location.reload();
@@ -1279,13 +1358,17 @@ function openActuacionForm(id){
   });
   return overlay;
 }
-function smallModal(title, bodyHTML){
+function smallModal(title, bodyHTML, opts = {}){
   const ov = document.createElement("div"); ov.id="modal-overlay"; ov.className="open";
   ov.style.cssText="position:fixed;inset:0;background:rgba(10,12,16,.5);display:flex;align-items:center;justify-content:center;z-index:250;padding:24px;";
   ov.innerHTML = `<div class="modal small"><div class="modal-head"><h2>${esc(title)}</h2><button class="btn sm ghost close-x" id="sm-close">✕</button></div><div class="modal-body">${bodyHTML}</div></div>`;
   document.body.appendChild(ov);
-  ov.querySelector("#sm-close").addEventListener("click", ()=>ov.remove());
-  ov.addEventListener("click",(e)=>{ if(e.target===ov) ov.remove(); });
+  if(opts.locked){
+    ov.querySelector("#sm-close").remove();
+  } else {
+    ov.querySelector("#sm-close").addEventListener("click", ()=>ov.remove());
+    ov.addEventListener("click",(e)=>{ if(e.target===ov) ov.remove(); });
+  }
   return ov;
 }
 
@@ -1751,7 +1834,7 @@ document.getElementById("btn-whatsapp-config").addEventListener("click", async (
   const overlay = smallModal("Alertas automáticas", `
     <div style="font-size:12px;color:var(--text-muted);line-height:1.6;margin-bottom:14px;">
       Cada día, a la hora que elijas (hora de Colombia), el servidor envía <b>un WhatsApp</b> con los procesos que vencen
-      en <b>7 o 3 días</b> (o que ya vencieron sin aviso). Funciona aunque nadie tenga la página abierta.
+      en <b>7, 3 y 1 día</b>, y el <b>mismo día</b> del vencimiento (o que ya vencieron sin aviso). Funciona aunque nadie tenga la página abierta.
       La misma hora se usa para las notificaciones de la app.<br><br>
       <b>Cómo obtener tu API key de CallMeBot (gratis):</b><br>
       1. Guarda el contacto <b>+34 694 29 84 96</b> en tu WhatsApp.<br>
@@ -1890,7 +1973,7 @@ document.getElementById("btn-push-config").addEventListener("click", async ()=>{
     const perm = Notification.permission;
     body.innerHTML = `
       <p style="font-size:12.5px;color:var(--text-muted);line-height:1.6;margin-top:0;">
-        Recibe un aviso en este dispositivo cuando tengas procesos que vencen en <b>7 o 3 días</b>, todos los días a la hora configurada,
+        Recibe un aviso en este dispositivo cuando tengas procesos que vencen en <b>7, 3 y 1 día</b> o el <b>mismo día</b>, a la hora configurada,
         <b>aunque la página esté cerrada</b>. Actívalo en cada dispositivo donde quieras recibirlo.
       </p>
       <div style="padding:10px 12px;border:1px solid var(--border);border-radius:10px;font-size:13px;margin-bottom:14px;">
@@ -1949,6 +2032,9 @@ async function init(){
   const { data: { session } } = await sbClient.auth.getSession();
   if(!session){
     showLogin();
+    if(/error_code=otp_expired|error=access_denied/.test(location.hash + location.search)){
+      toast("El enlace para restablecer la contraseña venció o ya se usó. Pide uno nuevo con '¿Olvidaste tu contraseña?'.","err");
+    }
   } else {
     document.getElementById("sb-user-email").textContent = session.user.email;
     await loadMyProfile();
@@ -1957,6 +2043,7 @@ async function init(){
     if(themeMeta && themeMeta.value==="dark"){ document.documentElement.setAttribute("data-theme","dark"); document.getElementById("theme-toggle").querySelector(".dot").textContent="☀"; }
     wireRealtimeSync();
     await refreshAll();
+    if(RECOVERY_MODE) openPasswordDialog({ recovery:true });
   }
   // Service worker: necesario para recibir notificaciones aunque la página esté cerrada
   if("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(()=>{});
