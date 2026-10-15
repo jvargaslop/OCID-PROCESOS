@@ -37,9 +37,8 @@ function toRow(store, obj){
     row.process_id = row.processId;
     delete row.processId;
   }
-  if(store==="processes" && "_waSent" in row){
-    row.wa_sent = row._waSent;
-    delete row._waSent;
+  if(store==="processes"){
+    delete row._waSent; // las marcas de "alerta ya enviada" las escribe solo el servidor (daily-alerts)
   }
   return row;
 }
@@ -144,9 +143,13 @@ document.getElementById("btn-forgot-password").addEventListener("click", async (
   if(error){ toast("No se pudo enviar el correo: "+error.message,"err"); return; }
   toast("Te enviamos un correo para restablecer tu contraseña","ok");
 });
-document.getElementById("btn-logout").addEventListener("click", async ()=>{
+async function doLogout(){
   await sbClient.auth.signOut();
   location.reload();
+}
+["btn-logout","btn-logout-top"].forEach(id=>{
+  const b = document.getElementById(id);
+  if(b) b.addEventListener("click", doLogout);
 });
 
 let REALTIME_WIRED = false;
@@ -177,6 +180,8 @@ async function loadMyProfile(){
   STATE.me = profile;
   const roleBadge = document.getElementById("sb-user-role");
   if(roleBadge) roleBadge.textContent = profile.role==="admin" ? "Administrador" : "Usuario";
+  const waBtn = document.getElementById("btn-whatsapp-config");
+  if(waBtn) waBtn.classList.toggle("hidden", profile.role!=="admin");
 }
 
 async function onAuthReady(){
@@ -334,7 +339,6 @@ async function refreshAll(){
   await reloadProcesses();
   renderCurrentView();
   updateGlobalTasksBadge();
-  checkWhatsappAlerts();
 }
 
 /* ============================================================
@@ -1707,141 +1711,219 @@ async function renderHistorialTab(id){
 }
 
 /* ============================================================
-   14. BACKUP / RESTORE
-   ============================================================ */
-document.getElementById("btn-backup").addEventListener("click", async ()=>{
-  const data = {};
-  for(const s of ["processes","actuaciones","documentos","personas","notas_items","tareas","historial","meta"]) data[s] = await DB.all(s);
-  const json = JSON.stringify({exportedAt:new Date().toISOString(), version:"cloud-v1", data});
-  downloadBlob(json, "application/json", `ocid_procesos_backup_${todayStr()}.json`);
-  toast("Copia de seguridad descargada (solo lectura, no restaurable desde aquí)","ok");
-});
-document.getElementById("btn-restore").addEventListener("click", ()=>{
-  toast("En la versión en la nube, 'Restaurar' no está disponible: podría corromper los datos compartidos del equipo. Usa 'Backup' solo como copia de seguridad de lectura.","err");
-});
-
-/* ============================================================
-   14b. ALERTAS POR WHATSAPP (CallMeBot) — requiere internet
+   14b. ALERTAS AUTOMÁTICAS (WhatsApp + notificaciones de la app)
    ------------------------------------------------------------
-   CallMeBot es un servicio gratuito de terceros (no de Anthropic).
-   Envía un WhatsApp automático cuando a un proceso le faltan
-   exactamente 7 días para su fecha de vencimiento (general o de
-   un término manual). Solo funciona mientras el navegador tenga
-   esta pestaña abierta y con conexión a internet en ese momento;
-   el resto de la app sigue funcionando 100% offline.
+   Las alertas ya NO dependen de tener esta página abierta: las envía el
+   servidor (Edge Function "daily-alerts", programada con pg_cron) una vez
+   al día a la hora configurada (hora de Colombia). Aquí solo se configuran
+   y se prueban.
    ============================================================ */
-function buildCallMeBotUrl(cfg, text){
-  let phone = (cfg.phone||"").replace(/[^\d+]/g,"");
-  if(!phone.startsWith("+")) phone = "+57"+phone.replace(/^0+/,""); // Colombia por defecto
-  return `https://api.callmebot.com/whatsapp.php?phone=${encodeURIComponent(phone)}&text=${encodeURIComponent(text)}&apikey=${encodeURIComponent(cfg.apikey)}`;
-}
-function sendWhatsappMessage(cfg, text){
-  // Envío "silencioso" (fire-and-forget) vía pixel de imagen para evitar bloqueos CORS
-  // desde JavaScript en el navegador. No se puede leer la respuesta, pero la petición sí sale.
+const ALERTS_FN = "daily-alerts";
+
+async function callAlertsFn(action){
+  const { data, error } = await sbClient.functions.invoke(ALERTS_FN, { body:{ action } });
+  if(!error) return { ok:true, data, message:null };
+  let msg = error.message || "Error desconocido";
   try{
-    const url = buildCallMeBotUrl(cfg, text);
-    const img = new Image();
-    img.referrerPolicy = "no-referrer";
-    img.src = url;
-  }catch(err){ console.error("Error enviando WhatsApp:", err); }
+    const ctx = error.context;
+    if(ctx && ctx.status === 404) msg = "La función 'daily-alerts' todavía no está creada en Supabase (Edge Functions).";
+    else if(ctx && typeof ctx.json === "function"){
+      const j = await ctx.json();
+      if(j && (j.error || j.detail || j.message)) msg = j.error || j.detail || j.message;
+    }
+  }catch(e){}
+  return { ok:false, data:null, message:msg };
 }
+
 async function getWhatsappConfig(){
   const rec = await DB.get("meta","whatsappConfig").catch(()=>null);
   return rec ? rec.value : null;
 }
-function calendarDaysLeft(dateStr){
-  if(!dateStr) return null;
-  const due = new Date(dateStr+"T00:00:00");
-  const today = new Date(); today.setHours(0,0,0,0);
-  return Math.round((due-today)/86400000);
-}
-const WA_THRESHOLDS = [7,3];      // días antes del vencimiento en que se avisa
-const WA_CATCHUP_LIMIT = -30;      // no reenviar alertas "atrasadas" de procesos vencidos hace más de 30 días
 
-async function checkWhatsappAlerts(){
-  const cfg = await getWhatsappConfig();
-  if(!cfg || !cfg.enabled || !cfg.apikey || !cfg.phone) return;
-  for(const p of STATE.processes){
-    if(p.estado==="Archivado") continue;
-    let changed = false;
-
-    // Vencimiento general del proceso
-    if(p.fechaVencimiento){
-      const dl = calendarDaysLeft(p.fechaVencimiento);
-      p._waSent = p._waSent || {};
-      const sentList = p._waSent[p.fechaVencimiento] = p._waSent[p.fechaVencimiento] || [];
-      for(const th of WA_THRESHOLDS){
-        if(dl!==null && dl<=th && dl>=WA_CATCHUP_LIMIT && !sentList.includes(th)){
-          const diasTxt = dl<0 ? `vencido hace ${Math.abs(dl)} día(s)` : (dl===0? "vence hoy" : `vence en ${dl} día(s)`);
-          sendWhatsappMessage(cfg, `⚠️ OCID PROCESOS\nProceso: ${p.radicado||"(sin radicado)"}\n${diasTxt}: ${fmtDate(p.fechaVencimiento)}`);
-          sentList.push(th); changed = true;
-        }
-      }
-    }
-
-    // Términos manuales (pestaña Términos)
-    (p.terminos||[]).forEach(t=>{
-      if(t.cumplido || !t.fechaVence) return;
-      const dl = calendarDaysLeft(t.fechaVence);
-      t._waSent = t._waSent || {};
-      const sentList = t._waSent[t.fechaVence] = t._waSent[t.fechaVence] || [];
-      WA_THRESHOLDS.forEach(th=>{
-        if(dl!==null && dl<=th && dl>=WA_CATCHUP_LIMIT && !sentList.includes(th)){
-          const diasTxt = dl<0 ? `vencido hace ${Math.abs(dl)} día(s)` : (dl===0? "vence hoy" : `vence en ${dl} día(s)`);
-          sendWhatsappMessage(cfg, `⚠️ OCID PROCESOS\nProceso: ${p.radicado||"(sin radicado)"}\nTérmino "${t.nombre}" — ${diasTxt}: ${fmtDate(t.fechaVence)}`);
-          sentList.push(th); changed = true;
-        }
-      });
-    });
-
-    if(changed) await DB.put("processes", p);
-  }
-}
+/* ---- Configuración de WhatsApp (solo administrador) ---- */
 document.getElementById("btn-whatsapp-config").addEventListener("click", async ()=>{
-  const cfg = (await getWhatsappConfig()) || {phone:"3158501046", apikey:"", enabled:false};
-  const overlay = smallModal("Alertas por WhatsApp (CallMeBot)", `
+  const cfg = (await getWhatsappConfig()) || {phone:"3158501046", apikey:"", enabled:false, hora:8};
+  const hora = Number.isInteger(cfg.hora) ? cfg.hora : 8;
+  const horaOpts = Array.from({length:24},(_,h)=>{
+    const h12 = h%12===0 ? 12 : h%12;
+    return `<option value="${h}" ${h===hora?"selected":""}>${h12}:00 ${h<12?"a. m.":"p. m."}</option>`;
+  }).join("");
+  const overlay = smallModal("Alertas automáticas", `
     <div style="font-size:12px;color:var(--text-muted);line-height:1.6;margin-bottom:14px;">
-      Envía un WhatsApp automático cuando falten <b>7 días</b> para el vencimiento de un proceso o término.
-      Requiere internet en el momento del envío y una <b>API key gratuita de CallMeBot</b> (no la genera esta app).<br><br>
-      <b>Cómo obtener tu API key:</b><br>
+      Cada día, a la hora que elijas (hora de Colombia), el servidor envía <b>un WhatsApp</b> con los procesos que vencen
+      en <b>7 o 3 días</b> (o que ya vencieron sin aviso). Funciona aunque nadie tenga la página abierta.
+      La misma hora se usa para las notificaciones de la app.<br><br>
+      <b>Cómo obtener tu API key de CallMeBot (gratis):</b><br>
       1. Guarda el contacto <b>+34 694 29 84 96</b> en tu WhatsApp.<br>
-      2. Desde tu número, envíale el mensaje: <i>"I allow callmebot to send me messages"</i>.<br>
+      2. Desde tu número, envíale: <i>"I allow callmebot to send me messages"</i>.<br>
       3. Te responderá con tu API key — cópiala aquí abajo.
     </div>
-    <div class="field"><label class="field-label">Tu número de WhatsApp</label><input type="text" id="wa-phone" value="${esc(cfg.phone)}" placeholder="3158501046"></div>
+    <div class="field"><label class="field-label">Número de WhatsApp que recibe las alertas</label><input type="text" id="wa-phone" value="${esc(cfg.phone)}" placeholder="3158501046"></div>
     <div class="field"><label class="field-label">API key de CallMeBot</label><input type="text" id="wa-apikey" value="${esc(cfg.apikey)}" placeholder="Ej: 123456"></div>
+    <div class="field"><label class="field-label">Hora de envío diario</label><select id="wa-hora">${horaOpts}</select></div>
     <div class="field" style="display:flex;align-items:center;gap:8px;">
       <input type="checkbox" id="wa-enabled" style="width:auto;" ${cfg.enabled?"checked":""}>
-      <label for="wa-enabled" style="font-size:13px;">Activar envío automático de alertas</label>
+      <label for="wa-enabled" style="font-size:13px;">Activar envío automático por WhatsApp</label>
     </div>
-    <div style="display:flex;justify-content:space-between;gap:8px;margin-top:6px;">
-      <button class="btn sm" id="wa-test">Enviar mensaje de prueba</button>
+    <div style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px;margin-top:6px;">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="btn sm" id="wa-test" title="Guarda y envía un mensaje de prueba desde el servidor">Guardar y enviar prueba</button>
+        <button class="btn sm" id="wa-run" title="Revisa los vencimientos ahora mismo, sin esperar la hora programada">Revisar vencimientos ahora</button>
+      </div>
       <div style="display:flex;gap:8px;">
         <button class="btn" id="wa-cancel">Cancelar</button>
         <button class="btn primary" id="wa-save">Guardar</button>
       </div>
     </div>`);
+
+  function readForm(){
+    return {
+      phone: overlay.querySelector("#wa-phone").value.trim(),
+      apikey: overlay.querySelector("#wa-apikey").value.trim(),
+      enabled: overlay.querySelector("#wa-enabled").checked,
+      hora: Number(overlay.querySelector("#wa-hora").value),
+    };
+  }
+  async function saveForm(){
+    const v = readForm();
+    if(v.enabled && (!v.phone || !v.apikey)){ toast("Para activar necesitas número y API key","err"); return null; }
+    await DB.put("meta", {key:"whatsappConfig", value:v});
+    return v;
+  }
   overlay.querySelector("#wa-cancel").addEventListener("click", ()=>overlay.remove());
-  overlay.querySelector("#wa-test").addEventListener("click", ()=>{
-    const phone = overlay.querySelector("#wa-phone").value.trim();
-    const apikey = overlay.querySelector("#wa-apikey").value.trim();
-    if(!phone || !apikey){ toast("Ingresa el número y la API key primero","err"); return; }
-    const url = buildCallMeBotUrl({phone,apikey}, "✅ Prueba desde OCID PROCESOS: la conexión con CallMeBot funciona correctamente.");
-    window.open(url, "_blank");
-    toast("Prueba enviada, revisa tu WhatsApp","ok");
-  });
   overlay.querySelector("#wa-save").addEventListener("click", async ()=>{
-    const phone = overlay.querySelector("#wa-phone").value.trim();
-    const apikey = overlay.querySelector("#wa-apikey").value.trim();
-    const enabled = overlay.querySelector("#wa-enabled").checked;
-    if(enabled && (!phone || !apikey)){ toast("Para activar necesitas número y API key","err"); return; }
-    await DB.put("meta", {key:"whatsappConfig", value:{phone, apikey, enabled}});
-    toast("Configuración de WhatsApp guardada","ok");
-    overlay.remove();
-    await checkWhatsappAlerts();
+    try{
+      if(await saveForm()){ toast("Configuración guardada","ok"); overlay.remove(); }
+    }catch(err){ toast("No se pudo guardar: "+(err.message||err),"err"); }
+  });
+  overlay.querySelector("#wa-test").addEventListener("click", async ()=>{
+    try{
+      const v = await saveForm(); if(!v) return;
+      if(!v.phone || !v.apikey){ toast("Ingresa el número y la API key primero","err"); return; }
+      toast("Enviando prueba desde el servidor...","ok");
+      const r = await callAlertsFn("test_whatsapp");
+      toast(r.ok ? "Prueba enviada: revisa tu WhatsApp" : "No se pudo enviar: "+r.message, r.ok?"ok":"err");
+    }catch(err){ toast("Error: "+(err.message||err),"err"); }
+  });
+  overlay.querySelector("#wa-run").addEventListener("click", async ()=>{
+    try{
+      const v = await saveForm(); if(!v) return;
+      toast("Revisando vencimientos...","ok");
+      const r = await callAlertsFn("run_now");
+      if(!r.ok){ toast("No se pudo ejecutar: "+r.message,"err"); return; }
+      const d = r.data || {};
+      if(!d.items){ toast(d.message || "No hay alertas pendientes por enviar","ok"); return; }
+      const wa = d.whatsapp && d.whatsapp.ok ? "WhatsApp ✓" : "WhatsApp ✗"+(d.whatsapp && d.whatsapp.detail ? " ("+d.whatsapp.detail+")" : "");
+      const pu = d.push ? `notificaciones: ${d.push.delivered} enviadas` : "";
+      toast(`${d.items} alerta(s) — ${wa}${pu?" · "+pu:""}`, d.delivered>0?"ok":"err");
+    }catch(err){ toast("Error: "+(err.message||err),"err"); }
   });
 });
 
+/* ---- Notificaciones de la app (push) ---- */
+function pushSupported(){ return ("serviceWorker" in navigator) && ("PushManager" in window) && ("Notification" in window); }
+function urlBase64ToUint8Array(b64){
+  const pad = "=".repeat((4 - (b64.length % 4)) % 4);
+  const raw = atob((b64 + pad).replace(/-/g,"+").replace(/_/g,"/"));
+  return Uint8Array.from(raw, c=>c.charCodeAt(0));
+}
+async function getSwReg(){
+  const reg = await navigator.serviceWorker.register("sw.js");
+  await Promise.race([
+    navigator.serviceWorker.ready,
+    new Promise((_,rej)=> setTimeout(()=> rej(new Error("El servicio de notificaciones no arrancó. Recarga la página e inténtalo de nuevo.")), 8000)),
+  ]);
+  return reg;
+}
+async function enablePush(){
+  const perm = await Notification.requestPermission();
+  if(perm !== "granted"){
+    throw new Error(perm==="denied"
+      ? "Las notificaciones están bloqueadas en este navegador. Actívalas desde el candado junto a la dirección (Configuración del sitio)."
+      : "No se concedió el permiso de notificaciones.");
+  }
+  const r = await callAlertsFn("public_key");
+  if(!r.ok) throw new Error(r.message);
+  const publicKey = r.data && r.data.publicKey;
+  if(!publicKey) throw new Error("Falta configurar el secreto VAPID_PUBLIC_KEY en Supabase.");
+  const want = urlBase64ToUint8Array(publicKey);
+  const reg = await getSwReg();
+  let sub = await reg.pushManager.getSubscription();
+  if(sub){
+    // si las claves del servidor cambiaron, la suscripción vieja ya no sirve
+    const cur = sub.options && sub.options.applicationServerKey ? new Uint8Array(sub.options.applicationServerKey) : null;
+    const same = cur && cur.length===want.length && cur.every((v,i)=>v===want[i]);
+    if(!same){ await sub.unsubscribe(); sub = null; }
+  }
+  if(!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly:true, applicationServerKey:want });
+  const j = sub.toJSON();
+  const { error } = await sbClient.rpc("register_push_subscription", {
+    p_endpoint:j.endpoint, p_p256dh:j.keys.p256dh, p_auth:j.keys.auth, p_user_agent:(navigator.userAgent||"").slice(0,200),
+  });
+  if(error) throw new Error("No se pudo registrar este dispositivo: "+error.message);
+}
+async function disablePush(){
+  const reg = await getSwReg();
+  const sub = await reg.pushManager.getSubscription();
+  if(sub){
+    const endpoint = sub.endpoint;
+    await sub.unsubscribe();
+    await sbClient.from("push_subscriptions").delete().eq("endpoint", endpoint);
+  }
+}
+
+document.getElementById("btn-push-config").addEventListener("click", async ()=>{
+  const overlay = smallModal("Notificaciones de la app", `<div id="push-body"></div>`);
+  const body = overlay.querySelector("#push-body");
+
+  async function render(){
+    if(!pushSupported()){
+      body.innerHTML = `<p style="font-size:13px;color:var(--text-2);line-height:1.6;">Este navegador no permite notificaciones.<br><br>
+        <b>En iPhone o iPad:</b> abre la app en Safari, toca <b>Compartir → Añadir a pantalla de inicio</b>, y ábrela desde ese ícono. Luego vuelve aquí.</p>`;
+      return;
+    }
+    let subscribed = false;
+    try{
+      const reg = await getSwReg();
+      subscribed = !!(await reg.pushManager.getSubscription());
+    }catch(e){}
+    const perm = Notification.permission;
+    body.innerHTML = `
+      <p style="font-size:12.5px;color:var(--text-muted);line-height:1.6;margin-top:0;">
+        Recibe un aviso en este dispositivo cuando tengas procesos que vencen en <b>7 o 3 días</b>, todos los días a la hora configurada,
+        <b>aunque la página esté cerrada</b>. Actívalo en cada dispositivo donde quieras recibirlo.
+      </p>
+      <div style="padding:10px 12px;border:1px solid var(--border);border-radius:10px;font-size:13px;margin-bottom:14px;">
+        Este dispositivo: <b>${subscribed ? "✅ notificaciones activadas" : "⚪ desactivadas"}</b>
+        ${perm==="denied" ? `<div style="color:var(--danger);font-size:12px;margin-top:6px;">El navegador las tiene bloqueadas para este sitio. Permítelas desde el candado junto a la dirección.</div>` : ""}
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        ${subscribed
+          ? `<button class="btn" id="push-off">Desactivar</button><button class="btn primary" id="push-test">Enviar notificación de prueba</button>`
+          : `<button class="btn primary" id="push-on">Activar notificaciones</button>`}
+      </div>`;
+    const on = body.querySelector("#push-on"), off = body.querySelector("#push-off"), test = body.querySelector("#push-test");
+    if(on) on.addEventListener("click", async ()=>{
+      on.disabled = true;
+      try{ await enablePush(); toast("Notificaciones activadas en este dispositivo","ok"); }
+      catch(err){ toast(err.message||String(err),"err"); }
+      await render();
+    });
+    if(off) off.addEventListener("click", async ()=>{
+      off.disabled = true;
+      try{ await disablePush(); toast("Notificaciones desactivadas","ok"); }
+      catch(err){ toast("No se pudo desactivar: "+(err.message||err),"err"); }
+      await render();
+    });
+    if(test) test.addEventListener("click", async ()=>{
+      test.disabled = true;
+      const r = await callAlertsFn("test_push");
+      toast(r.ok && r.data && r.data.ok ? "Prueba enviada: debería aparecer en unos segundos" : "No se pudo enviar la prueba: "+(r.message||"revisa la configuración"), r.ok && r.data && r.data.ok ? "ok":"err");
+      test.disabled = false;
+    });
+  }
+  await render();
+});
 
 /* ============================================================
    15. EXPORTACIONES (resumen ejecutivo, CSV global)
@@ -1876,9 +1958,8 @@ async function init(){
     wireRealtimeSync();
     await refreshAll();
   }
-  // Revisa alertas de WhatsApp cada 30 minutos mientras la pestaña permanezca abierta,
-  // para detectar el cambio de día sin depender de que el usuario guarde algo.
-  setInterval(()=>{ if(!loginOverlay.classList.contains("open")) checkWhatsappAlerts(); }, 30*60*1000);
+  // Service worker: necesario para recibir notificaciones aunque la página esté cerrada
+  if("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(()=>{});
 
   sbClient.auth.onAuthStateChange((event)=>{
     if(event==="SIGNED_OUT") location.reload();

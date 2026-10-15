@@ -168,7 +168,7 @@ html[data-theme="dark"] .theme-toggle .dot{transform:translateX(18px);}
 .btn.ghost{border-color:transparent;background:transparent;}
 .btn.ghost:hover{background:var(--surface-2);}
 .btn.sm{padding:5px 9px;font-size:12px;}
-input[type=text],input[type=date],input[type=number],select,textarea{
+input[type=text],input[type=password],input[type=email],input[type=date],input[type=number],select,textarea{
   font-family:inherit;background:var(--surface);border:1px solid var(--border);border-radius:8px;
   padding:8px 10px;font-size:13px;color:var(--text);width:100%;outline:none;
 }
@@ -450,3 +450,11 @@ textarea.notes-area{min-height:220px;resize:vertical;font-family:var(--font-mono
 .scope-toggle button{border:none;background:transparent;color:var(--text-2);font-family:inherit;font-size:12.5px;font-weight:700;padding:6px 12px;border-radius:8px;cursor:pointer;}
 .scope-toggle button.active{background:var(--bg-elevated);color:var(--accent);box-shadow:var(--shadow-sm);}
 .scope-caption{font-size:12px;color:var(--text-muted);}
+
+/* Placeholders y autocompletado del navegador coherentes con el tema claro/oscuro */
+input::placeholder, textarea::placeholder{color:var(--text-muted);opacity:1;}
+input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:focus{
+  -webkit-text-fill-color:var(--text);
+  -webkit-box-shadow:0 0 0 1000px var(--surface) inset;
+  caret-color:var(--text);
+}
