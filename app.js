@@ -261,6 +261,8 @@ async function loadMyProfile(){
   if(roleBadge) roleBadge.textContent = profile.role==="admin" ? "Administrador" : "Usuario";
   const waBtn = document.getElementById("btn-whatsapp-config");
   if(waBtn) waBtn.classList.toggle("hidden", profile.role!=="admin");
+  const tgBtn = document.getElementById("btn-telegram-config");
+  if(tgBtn) tgBtn.classList.toggle("hidden", profile.role!=="admin");
 }
 
 async function onAuthReady(){
@@ -1128,20 +1130,52 @@ function fieldView(label, value){
   const has = value !== undefined && value !== null && String(value).trim() !== "";
   return `<div class="view-field"><div class="vl">${esc(label)}</div><div class="vv ${has?"":"empty"}">${has? esc(value) : "— sin dato —"}</div></div>`;
 }
+function timelineHTML(p){
+  const idxActual = FECHAS_FLUJO.findIndex(f=>ESTADO_A_FECHA[p.estado]===f.key);
+  const dias = (a,b)=> Math.round((new Date(b+"T00:00:00")-new Date(a+"T00:00:00"))/86400000);
+  let prevFecha = null;
+  const steps = FECHAS_FLUJO.map((f,i)=>{
+    const fecha = p[f.key];
+    const cls = fecha ? (i===idxActual?"current":"done") : (i===idxActual?"current":"pending");
+    let gap = "";
+    if(fecha && prevFecha){ const d = dias(prevFecha,fecha); gap = `<div class="tlv-gap">${d>=0?"+":""}${d} d</div>`; }
+    if(fecha) prevFecha = fecha;
+    const icon = fecha ? "✓" : (i===idxActual ? "●" : String(i+1));
+    return `<div class="tlv-step ${cls}">
+      <div class="tlv-dot">${icon}</div>
+      <div class="tlv-label">${esc(f.label.replace("Fecha de ","").replace(/^./,c=>c.toUpperCase()))}</div>
+      <div class="tlv-date">${fecha? esc(fmtDate(fecha)) : "Pendiente"}</div>
+      ${gap}
+    </div>`;
+  }).join("");
+
+  // Barra de plazo: apertura → vencimiento, con marcador de hoy
+  let plazo = "";
+  if(p.fechaApertura && p.fechaVencimiento){
+    const t0 = new Date(p.fechaApertura+"T00:00:00").getTime(), t1 = new Date(p.fechaVencimiento+"T00:00:00").getTime();
+    const pct = Math.max(0, Math.min(100, ((Date.now()-t0)/Math.max(1,t1-t0))*100));
+    const cerrado = p.estado==="Archivado";
+    const vencido = !cerrado && p.fechaVencimiento < todayStr();
+    const hab = (!cerrado && !vencido) ? diasHabilesHasta(p.fechaVencimiento) : null;
+    const tono = cerrado?"ok":vencido?"bad":(hab<=7?"warn":"ok");
+    const txt = cerrado ? "Proceso archivado" : vencido ? `Vencido hace ${Math.abs(diasHabilesHasta(p.fechaVencimiento))} días hábiles` : `Faltan ${hab} días hábiles`;
+    plazo = `<div class="tlv-plazo ${tono}">
+      <div class="tlv-plazo-head"><span>Plazo del proceso</span><b>${txt}</b></div>
+      <div class="tlv-bar"><div class="tlv-fill" style="width:${cerrado?100:pct}%"></div>${cerrado?"":`<div class="tlv-today" style="left:${pct}%"><span>Hoy</span></div>`}</div>
+      <div class="tlv-plazo-ends"><span>${esc(fmtDate(p.fechaApertura))}</span><span>${esc(fmtDate(p.fechaVencimiento))}</span></div>
+    </div>`;
+  }
+  return `<div class="tlv">${plazo}<div class="tlv-track">${steps}</div></div>`;
+}
+
 function resumenViewHTML(p){
   return `
-    <div class="grid2">
+    ${timelineHTML(p)}
+    <div class="grid2" style="margin-top:18px;">
       ${fieldView("Radicado", p.radicado)}
       ${fieldView("Investigado", p.investigado)}
       ${fieldView(p.quejosoTipo==="Informante"?"Informante":"Quejoso", p.quejoso)}
-      ${fieldView("Fecha de apertura", p.fechaApertura? fmtDate(p.fechaApertura):"")}
-      ${fieldView("Fecha de vencimiento", p.fechaVencimiento? fmtDate(p.fechaVencimiento):"")}
-      ${fieldView("Estado", p.estado)}
       ${fieldView("Prioridad", p.prioridad)}
-    </div>
-    <div class="section-title" style="margin-top:14px;">Línea de tiempo procesal</div>
-    <div class="grid2">
-      ${FECHAS_FLUJO.map(f=>fieldView(f.label, p[f.key]? fmtDate(p[f.key]):"")).join("")}
     </div>
     ${fieldView("Resumen del proceso", p.resumen)}
     ${fieldView("Observaciones", p.observaciones)}
@@ -1951,6 +1985,81 @@ document.getElementById("btn-whatsapp-config").addEventListener("click", async (
       const wa = d.whatsapp && d.whatsapp.ok ? "WhatsApp ✓" : "WhatsApp ✗"+(d.whatsapp && d.whatsapp.detail ? " ("+d.whatsapp.detail+")" : "");
       const pu = d.push ? `notificaciones: ${d.push.delivered} enviadas` : "";
       toast(`${d.items} alerta(s) — ${wa}${pu?" · "+pu:""}`, d.delivered>0?"ok":"err");
+    }catch(err){ toast("Error: "+(err.message||err),"err"); }
+  });
+});
+
+/* ---- Configuración de Telegram (solo administrador) ---- */
+document.getElementById("btn-telegram-config").addEventListener("click", async ()=>{
+  const rec = await DB.get("meta","telegramConfig").catch(()=>null);
+  const cfg = (rec && rec.value) || {chatId:"", enabled:false, hora:8};
+  const hora = Number.isInteger(cfg.hora) ? cfg.hora : 8;
+  const horaOpts = Array.from({length:24},(_,h)=>{
+    const h12 = h%12===0 ? 12 : h%12;
+    return `<option value="${h}" ${h===hora?"selected":""}>${h12}:00 ${h<12?"a. m.":"p. m."}</option>`;
+  }).join("");
+  const overlay = smallModal("Alertas por Telegram", `
+    <div style="font-size:12px;color:var(--text-muted);line-height:1.6;margin-bottom:14px;">
+      Cada día, a la hora elegida (hora de Colombia), el bot te escribe los términos que vencen en <b>7, 3 y 1 día hábil</b>,
+      el <b>mismo día</b>, y los ya vencidos.<br><br>
+      <b>Cómo conectarlo:</b><br>
+      1. En Telegram abre <b>@BotFather</b>, envía <i>/newbot</i> y copia el token que te da.<br>
+      2. En Supabase → Edge Functions → Secrets crea <b>TELEGRAM_BOT_TOKEN</b> con ese token (el token nunca se guarda en la app).<br>
+      3. Escríbele <i>/start</i> a tu bot nuevo. Para saber tu Chat ID, escríbele a <b>@userinfobot</b>.<br>
+      4. Pega aquí el Chat ID (para un grupo, añade el bot al grupo y usa el ID negativo del grupo).
+    </div>
+    <div class="field"><label class="field-label">Chat ID</label><input type="text" id="tg-chat" value="${esc(cfg.chatId)}" placeholder="Ej: 123456789"></div>
+    <div class="field"><label class="field-label">Hora de envío diario</label><select id="tg-hora">${horaOpts}</select></div>
+    <div class="field" style="display:flex;align-items:center;gap:8px;">
+      <input type="checkbox" id="tg-enabled" style="width:auto;" ${cfg.enabled?"checked":""}>
+      <label for="tg-enabled" style="font-size:13px;">Activar envío automático por Telegram</label>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px;margin-top:6px;">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="btn sm" id="tg-test">Guardar y enviar prueba</button>
+        <button class="btn sm" id="tg-run" title="Revisa los vencimientos ahora mismo">Revisar vencimientos ahora</button>
+      </div>
+      <div style="display:flex;gap:8px;">
+        <button class="btn" id="tg-cancel">Cancelar</button>
+        <button class="btn primary" id="tg-save">Guardar</button>
+      </div>
+    </div>`);
+  async function saveForm(){
+    const v = { chatId:overlay.querySelector("#tg-chat").value.trim(), enabled:overlay.querySelector("#tg-enabled").checked, hora:Number(overlay.querySelector("#tg-hora").value) };
+    if(v.enabled && !v.chatId){ toast("Para activar necesitas el Chat ID","err"); return null; }
+    await DB.put("meta",{key:"telegramConfig", value:v});
+    return v;
+  }
+  async function callTg(action){
+    const { data, error } = await sbClient.functions.invoke("telegram-alerts", { body:{ action } });
+    if(!error) return { ok:true, data };
+    let msg = error.message || "Error desconocido";
+    try{
+      const ctx = error.context;
+      if(ctx && ctx.status===404) msg = "La función 'telegram-alerts' aún no está desplegada en Supabase.";
+      else if(ctx && typeof ctx.json==="function"){ const j = await ctx.json(); if(j && (j.error||j.detail)) msg = j.error||j.detail; }
+    }catch(e){}
+    return { ok:false, message:msg };
+  }
+  overlay.querySelector("#tg-cancel").addEventListener("click", ()=>overlay.remove());
+  overlay.querySelector("#tg-save").addEventListener("click", async ()=>{
+    try{ if(await saveForm()){ toast("Configuración guardada","ok"); overlay.remove(); } }
+    catch(err){ toast("No se pudo guardar: "+(err.message||err),"err"); }
+  });
+  overlay.querySelector("#tg-test").addEventListener("click", async ()=>{
+    try{
+      const v = await saveForm(); if(!v) return;
+      const r = await callTg("test_telegram");
+      toast(r.ok ? "Prueba enviada: revisa Telegram" : "No se pudo enviar: "+r.message, r.ok?"ok":"err");
+    }catch(err){ toast("Error: "+(err.message||err),"err"); }
+  });
+  overlay.querySelector("#tg-run").addEventListener("click", async ()=>{
+    try{
+      const v = await saveForm(); if(!v) return;
+      const r = await callTg("run_now");
+      if(!r.ok){ toast("No se pudo ejecutar: "+r.message,"err"); return; }
+      const d = r.data||{};
+      toast(d.items ? `${d.items} alerta(s) enviadas a Telegram` : (d.message||"No hay alertas pendientes"), "ok");
     }catch(err){ toast("Error: "+(err.message||err),"err"); }
   });
 });
