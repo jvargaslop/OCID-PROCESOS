@@ -333,6 +333,22 @@ function businessDaysBetween(from,to){
    ============================================================ */
 const ESTADOS = ["Indagación previa","Investigación disciplinaria","Pliego de cargos","Inhibitorio","Acumulado","Archivado"];
 const FOLDERS = ["Expediente Completo","Anexos"];
+// Línea de tiempo procesal: cada etapa guarda su propia fecha y NUNCA se borra al avanzar,
+// de modo que quedan todas: informe → indagación → investigación → pliego de cargos / archivo.
+// fechaArchivo es además la fecha de cierre real (la usan las estadísticas de tiempo).
+const FECHAS_FLUJO = [
+  {key:"fechaInforme",       label:"Fecha de informe"},
+  {key:"fechaIndagacion",    label:"Fecha de indagación"},
+  {key:"fechaInvestigacion", label:"Fecha de investigación"},
+  {key:"fechaPliego",        label:"Fecha de pliego de cargos"},
+  {key:"fechaArchivo",       label:"Fecha de archivo"},
+];
+const ESTADO_A_FECHA = {
+  "Indagación previa":"fechaIndagacion",
+  "Investigación disciplinaria":"fechaInvestigacion",
+  "Pliego de cargos":"fechaPliego",
+  "Archivado":"fechaArchivo",
+};
 const TERM_PLANTILLAS = [
   {nombre:"Pruebas", dias:10},{nombre:"Notificación personal", dias:5},{nombre:"Edicto", dias:3}
 ];
@@ -363,7 +379,12 @@ function fmtDate(s){ if(!s) return "—"; const d=new Date(s+"T00:00:00"); if(is
 function todayStr(){ return ymd(new Date()); }
 
 async function logHistorial(processId, cambio){
-  await DB.add("historial",{processId, fecha:new Date().toISOString(), cambio, usuario:"Usuario local"});
+  // Quién hizo el cambio: correo de la sesión (importante para trazabilidad disciplinaria).
+  let usuario = STATE.me && STATE.me.email;
+  if(!usuario){
+    try{ const { data:{ user } } = await sbClient.auth.getUser(); usuario = user && user.email; }catch(e){}
+  }
+  await DB.add("historial",{processId, fecha:new Date().toISOString(), cambio, usuario: usuario || "Usuario desconocido"});
 }
 
 /* ============================================================
@@ -465,7 +486,8 @@ document.getElementById("theme-toggle").addEventListener("click",async ()=>{
   const next = html.getAttribute("data-theme")==="dark"?"light":"dark";
   html.setAttribute("data-theme", next);
   document.getElementById("theme-toggle").querySelector(".dot").textContent = next==="dark"?"☀":"☾";
-  await DB.put("meta",{key:"theme", value:next});
+  // El tema es una preferencia de cada navegador: ya no se guarda en la base compartida.
+  try{ localStorage.setItem("ocid-theme", next); }catch(e){}
 });
 
 function renderCurrentView(){
@@ -502,10 +524,17 @@ function getOverdueTerms(p){
   if(p.estado==="Archivado") return [];
   return getAllTerms(p).filter(t=>!t.cumplido && t.fechaVence && t.fechaVence < todayStr());
 }
+// Días HÁBILES (sin fines de semana ni festivos colombianos) que faltan hasta una fecha "YYYY-MM-DD".
+// Es el mismo cálculo de la pestaña Términos, para que "vence en 3 días" signifique lo mismo en todas partes.
+function diasHabilesHasta(fechaStr){
+  return businessDaysBetween(new Date(todayStr()+"T00:00:00"), new Date(fechaStr+"T00:00:00"));
+}
 function getUpcomingTerms(p, days){
   if(p.estado==="Archivado") return [];
-  const limit = ymd(addDays(new Date(), days));
-  return getAllTerms(p).filter(t=>!t.cumplido && t.fechaVence && t.fechaVence>=todayStr() && t.fechaVence<=limit);
+  return getAllTerms(p).filter(t=>{
+    if(t.cumplido || !t.fechaVence || t.fechaVence < todayStr()) return false;
+    return diasHabilesHasta(t.fechaVence) <= days;
+  });
 }
 
 /* ============================================================
@@ -815,7 +844,7 @@ function renderTable(){
     if(c.key==="fechaApertura") v = fmtDate(v);
     else if(c.key==="fechaVencimiento"){
       const overdue = v && v<todayStr() && p.estado!=="Archivado";
-      const soon = v && !overdue && v<=ymd(addDays(new Date(),7)) && p.estado!=="Archivado";
+      const soon = v && !overdue && p.estado!=="Archivado" && diasHabilesHasta(v)<=7;
       const color = overdue?"var(--danger)":soon?"var(--warning)":"inherit";
       const weight = (overdue||soon)?"700":"inherit";
       v = `<span style="color:${color};font-weight:${weight};">${fmtDate(v)}${overdue?" ⚠️":soon?" ⏳":""}</span>`;
@@ -932,11 +961,18 @@ async function renderStats(){
   renderBarGroup("stat-prioridad", byPrioridad);
 
   const archivados = ps.filter(p=>p.estado==="Archivado");
+  // Tiempo hasta archivo: apertura → fecha de archivo REAL (campo fechaArchivo).
+  // Ya no se usa la última edición como cierre, porque cualquier cambio posterior la movía.
+  // Los archivados antiguos sin fecha de archivo no entran al promedio hasta que se les complete.
   let avgDays = "—";
-  const closedWithDates = archivados.filter(p=>p.fechaApertura);
+  const closedWithDates = archivados.filter(p=>p.fechaApertura && p.fechaArchivo);
+  const sinFechaArchivo = archivados.length - closedWithDates.length;
   if(closedWithDates.length){
-    const totalDays = closedWithDates.reduce((s,p)=> s + Math.abs((new Date(p.actualizadoEn||Date.now())-new Date(p.fechaApertura+"T00:00:00"))/86400000), 0);
+    const totalDays = closedWithDates.reduce((s,p)=> s + Math.max(0,(new Date(p.fechaArchivo+"T00:00:00")-new Date(p.fechaApertura+"T00:00:00"))/86400000), 0);
     avgDays = Math.round(totalDays/closedWithDates.length)+" días";
+    if(sinFechaArchivo>0) avgDays += ` <span style="color:var(--text-muted);font-weight:400;">(${closedWithDates.length} de ${archivados.length} archivados; faltan ${sinFechaArchivo} sin fecha de archivo)</span>`;
+  } else if(archivados.length){
+    avgDays = `<span style="color:var(--text-muted);font-weight:400;">sin datos: ${archivados.length} archivado(s) sin fecha de archivo</span>`;
   }
 
   // KPIs principales arriba
@@ -1103,6 +1139,10 @@ function resumenViewHTML(p){
       ${fieldView("Estado", p.estado)}
       ${fieldView("Prioridad", p.prioridad)}
     </div>
+    <div class="section-title" style="margin-top:14px;">Línea de tiempo procesal</div>
+    <div class="grid2">
+      ${FECHAS_FLUJO.map(f=>fieldView(f.label, p[f.key]? fmtDate(p[f.key]):"")).join("")}
+    </div>
     ${fieldView("Resumen del proceso", p.resumen)}
     ${fieldView("Observaciones", p.observaciones)}
     <div style="margin-top:14px;font-size:11.5px;color:var(--text-muted);">Última actualización: ${p.actualizadoEn? new Date(p.actualizadoEn).toLocaleString("es-CO") : "—"}</div>`;
@@ -1137,6 +1177,10 @@ function resumenFormHTML(p){
       </div>
       <div class="field"><label class="field-label">Prioridad</label><select id="f-prioridad">${["Alta","Media","Baja"].map(x=>`<option ${p.prioridad===x?"selected":""}>${x}</option>`).join("")}</select></div>
     </div>
+    <div class="section-title" style="margin-top:6px;">Línea de tiempo procesal <span style="font-weight:400;font-size:11px;color:var(--text-muted);">(informe → indagación → investigación → pliego / archivo; se conservan todas las fechas)</span></div>
+    <div class="grid2">
+      ${FECHAS_FLUJO.map(f=>`<div class="field"><label class="field-label">${f.label}</label><input type="date" id="f-${f.key}" value="${p[f.key]||""}"></div>`).join("")}
+    </div>
     <div class="field"><label class="field-label">Resumen del proceso</label><textarea id="f-resumen" rows="3" placeholder="Breve descripción del caso, para entenderlo de un vistazo">${esc(p.resumen)}</textarea></div>
     <div class="field"><label class="field-label">Observaciones</label><textarea id="f-observaciones" rows="4">${esc(p.observaciones)}</textarea></div>
     <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px;">
@@ -1169,6 +1213,7 @@ function bindResumenForm(p, id){
       observaciones:document.getElementById("f-observaciones").value.trim(),
       actualizadoEn:new Date().toISOString()
     };
+    FECHAS_FLUJO.forEach(f=>{ updated[f.key] = val(f.key) || null; });
     if(!updated.radicado){ toast("Ingresa al menos el radicado","err"); return; }
     let autoArchived = false;
     if(updated.estado==="Inhibitorio"){
@@ -1179,6 +1224,13 @@ function bindResumenForm(p, id){
       // si el proceso cambia de estado manualmente, se limpia el motivo de archivo automático
       updated.motivoArchivo = "";
     }
+    // Flujo de fechas: al cambiar a una etapa, se sella su fecha (hoy) si aún no tiene una.
+    // Nunca se borran las fechas de etapas anteriores.
+    if(p.estado !== updated.estado || !id){
+      const campo = ESTADO_A_FECHA[updated.estado];
+      if(campo && !updated[campo]) updated[campo] = todayStr();
+    }
+    if(updated.estado==="Archivado" && !updated.fechaArchivo) updated.fechaArchivo = todayStr();
     // Si el estado cambió (se pasó a una nueva etapa procesal), los términos
     // manuales que quedaron pendientes de la etapa anterior ya no aplican:
     // se marcan como cumplidos para que no sigan apareciendo como "vencidos"
@@ -2029,6 +2081,13 @@ document.getElementById("btn-export-exec").addEventListener("click", ()=>{
    16. INIT
    ============================================================ */
 async function init(){
+  // Tema guardado en este navegador (se aplica antes de pedir nada a la base de datos)
+  try{
+    if(localStorage.getItem("ocid-theme")==="dark"){
+      document.documentElement.setAttribute("data-theme","dark");
+      document.getElementById("theme-toggle").querySelector(".dot").textContent="☀";
+    }
+  }catch(e){}
   const { data: { session } } = await sbClient.auth.getSession();
   if(!session){
     showLogin();
@@ -2039,8 +2098,6 @@ async function init(){
     document.getElementById("sb-user-email").textContent = session.user.email;
     await loadMyProfile();
   initDashScope();
-    const themeMeta = await DB.get("meta","theme").catch(()=>null);
-    if(themeMeta && themeMeta.value==="dark"){ document.documentElement.setAttribute("data-theme","dark"); document.getElementById("theme-toggle").querySelector(".dot").textContent="☀"; }
     wireRealtimeSync();
     await refreshAll();
     if(RECOVERY_MODE) openPasswordDialog({ recovery:true });
