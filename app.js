@@ -45,6 +45,9 @@ function toRow(store, obj){
   if(store==="processes"){
     delete row._waSent; // las marcas de "alerta ya enviada" las escribe solo el servidor (daily-alerts)
   }
+  if(store==="actuaciones"){
+    delete row.alerts_sent; // marcas de "evento ya avisado": solo las escribe el servidor
+  }
   return row;
 }
 function fromRow(store, row){
@@ -1993,23 +1996,18 @@ document.getElementById("btn-whatsapp-config").addEventListener("click", async (
 document.getElementById("btn-telegram-config").addEventListener("click", async ()=>{
   const rec = await DB.get("meta","telegramConfig").catch(()=>null);
   const cfg = (rec && rec.value) || {chatId:"", enabled:false, hora:8};
-  const hora = Number.isInteger(cfg.hora) ? cfg.hora : 8;
-  const horaOpts = Array.from({length:24},(_,h)=>{
-    const h12 = h%12===0 ? 12 : h%12;
-    return `<option value="${h}" ${h===hora?"selected":""}>${h12}:00 ${h<12?"a. m.":"p. m."}</option>`;
-  }).join("");
   const overlay = smallModal("Alertas por Telegram", `
     <div style="font-size:12px;color:var(--text-muted);line-height:1.6;margin-bottom:14px;">
-      Cada día, a la hora elegida (hora de Colombia), el bot te escribe los términos que vencen en <b>7, 3 y 1 día hábil</b>,
+      Cada día, a la hora configurada (hora de Colombia), el bot te escribe los términos que vencen en <b>7, 3 y 1 día hábil</b>,
       el <b>mismo día</b>, y los ya vencidos.<br><br>
       <b>Cómo conectarlo:</b><br>
       1. En Telegram abre <b>@BotFather</b>, envía <i>/newbot</i> y copia el token que te da.<br>
-      2. En Supabase → Edge Functions → Secrets crea <b>TELEGRAM_BOT_TOKEN</b> con ese token (el token nunca se guarda en la app).<br>
+      2. En Supabase → Edge Functions → Secrets crea <b>TELEGRAM_BOT_TOKEN</b> con ese token (el token nunca se guarda en la app) y vuelve a desplegar <b>daily-alerts</b> con la versión nueva.<br>
       3. Escríbele <i>/start</i> a tu bot nuevo. Para saber tu Chat ID, escríbele a <b>@userinfobot</b>.<br>
       4. Pega aquí el Chat ID (para un grupo, añade el bot al grupo y usa el ID negativo del grupo).
     </div>
     <div class="field"><label class="field-label">Chat ID</label><input type="text" id="tg-chat" value="${esc(cfg.chatId)}" placeholder="Ej: 123456789"></div>
-    <div class="field"><label class="field-label">Hora de envío diario</label><select id="tg-hora">${horaOpts}</select></div>
+    <div style="font-size:11.5px;color:var(--text-muted);margin:-4px 0 12px;">Se envía a la misma hora que WhatsApp y las notificaciones de la app (se cambia en «Alertas WhatsApp»).</div>
     <div class="field" style="display:flex;align-items:center;gap:8px;">
       <input type="checkbox" id="tg-enabled" style="width:auto;" ${cfg.enabled?"checked":""}>
       <label for="tg-enabled" style="font-size:13px;">Activar envío automático por Telegram</label>
@@ -2025,18 +2023,18 @@ document.getElementById("btn-telegram-config").addEventListener("click", async (
       </div>
     </div>`);
   async function saveForm(){
-    const v = { chatId:overlay.querySelector("#tg-chat").value.trim(), enabled:overlay.querySelector("#tg-enabled").checked, hora:Number(overlay.querySelector("#tg-hora").value) };
+    const v = { chatId:overlay.querySelector("#tg-chat").value.trim(), enabled:overlay.querySelector("#tg-enabled").checked };
     if(v.enabled && !v.chatId){ toast("Para activar necesitas el Chat ID","err"); return null; }
     await DB.put("meta",{key:"telegramConfig", value:v});
     return v;
   }
   async function callTg(action){
-    const { data, error } = await sbClient.functions.invoke("telegram-alerts", { body:{ action } });
+    const { data, error } = await sbClient.functions.invoke(ALERTS_FN, { body:{ action } });
     if(!error) return { ok:true, data };
     let msg = error.message || "Error desconocido";
     try{
       const ctx = error.context;
-      if(ctx && ctx.status===404) msg = "La función 'telegram-alerts' aún no está desplegada en Supabase.";
+      if(ctx && ctx.status===404) msg = "La función 'daily-alerts' no está desplegada (o aún no incluye Telegram): despliega la versión nueva.";
       else if(ctx && typeof ctx.json==="function"){ const j = await ctx.json(); if(j && (j.error||j.detail)) msg = j.error||j.detail; }
     }catch(e){}
     return { ok:false, message:msg };
